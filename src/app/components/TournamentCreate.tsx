@@ -12,6 +12,16 @@ type P = {
     weight_kg: number | null;
 };
 
+type NewMatch = {
+    tournament_id: string;
+    round: number;
+    slot: number;
+    player1: string | null;
+    player2: string | null;
+    bracket_type?: 'winner' | 'loser';
+    status?: 'pending' | 'done' | 'canceled';
+};
+
 function genCode() {
     return Math.random().toString(36).slice(2, 8).toUpperCase();
 }
@@ -146,8 +156,8 @@ export default function TournamentCreate() {
                 [players[i], players[j]] = [players[j], players[i]];
             }
 
-            // Round 1
-            const round1: any[] = [];
+            // Round 1 (Winner bracket)
+            const round1: NewMatch[] = [];
             for (let i = 0; i < players.length; i += 2) {
                 round1.push({
                     tournament_id: t!.id,
@@ -155,6 +165,8 @@ export default function TournamentCreate() {
                     slot: i / 2 + 1,
                     player1: players[i]?.id || null,
                     player2: players[i + 1]?.id || null,
+                    bracket_type: 'winner',
+                    status: 'pending',
                 });
             }
             if (round1.length) await supabase.from('matches').insert(round1);
@@ -198,16 +210,12 @@ export default function TournamentCreate() {
                     <input
                         placeholder="Prénom"
                         value={addForm.first_name}
-                        onChange={(e) =>
-                            setAddForm({ ...addForm, first_name: e.target.value })
-                        }
+                        onChange={(e) => setAddForm({ ...addForm, first_name: e.target.value })}
                     />
                     <input
                         placeholder="Nom (optionnel)"
                         value={addForm.last_name}
-                        onChange={(e) =>
-                            setAddForm({ ...addForm, last_name: e.target.value })
-                        }
+                        onChange={(e) => setAddForm({ ...addForm, last_name: e.target.value })}
                     />
                     <select
                         value={addForm.belt}
@@ -227,9 +235,7 @@ export default function TournamentCreate() {
                         placeholder="Poids (kg) (optionnel)"
                         type="number"
                         value={addForm.weight_kg}
-                        onChange={(e) =>
-                            setAddForm({ ...addForm, weight_kg: e.target.value })
-                        }
+                        onChange={(e) => setAddForm({ ...addForm, weight_kg: e.target.value })}
                     />
                     {warn && <div style={{ color: '#b36b00' }}>{warn}</div>}
                     <div style={{ display: 'flex', gap: 8 }}>

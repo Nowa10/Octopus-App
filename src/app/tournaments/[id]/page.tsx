@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import MatchList from '@/app/components/MatchList';
@@ -19,19 +19,14 @@ export default function TournamentDetail() {
     const [codeInput, setCodeInput] = useState('');
     const [canEdit, setCanEdit] = useState(false);
 
-    const loadTournament = async () => {
-        const { data } = await supabase
-            .from('tournaments')
-            .select('*')
-            .eq('id', id)
-            .single();
-
-        setTournament(data);
-    };
+    const loadTournament = useCallback(async () => {
+        const { data } = await supabase.from('tournaments').select('*').eq('id', id).single();
+        setTournament(data as Tournament | null);
+    }, [id]);
 
     useEffect(() => {
         loadTournament();
-    }, [id]);
+    }, [loadTournament]);
 
     useEffect(() => {
         const savedCode = localStorage.getItem(`code:${id}`);

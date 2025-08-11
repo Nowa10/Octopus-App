@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, useCallback } from 'react';
 import { supabase } from '@/lib/supabase';
 
 type P = {
@@ -43,7 +43,7 @@ export default function MatchList({
         fn();
     }
 
-    const load = async () => {
+    const load = useCallback(async () => {
         const { data: m } = await supabase
             .from('matches')
             .select('*')
@@ -58,7 +58,11 @@ export default function MatchList({
         const map: Record<string, P> = {};
         (ps || []).forEach((p) => (map[p.id] = p as P));
         setPeople(map);
-    };
+    }, [tournamentId]);
+
+    useEffect(() => {
+        load();
+    }, [load]);
 
     useEffect(() => {
         supabase
@@ -141,7 +145,7 @@ export default function MatchList({
         round: number,
         playerId: string
     ) {
-        let { data: nextMatch } = await supabase
+        const { data: nextMatch } = await supabase
             .from('matches')
             .select('*')
             .eq('tournament_id', tournamentId)

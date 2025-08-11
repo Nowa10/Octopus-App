@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import type { FormEvent } from 'react';
 import { supabase } from '@/lib/supabase';
 
 type P = {
@@ -35,7 +36,7 @@ export default function ParticipantsPage() {
         load();
     }, []);
 
-    const add = async (e: any) => {
+    const add = async (e: FormEvent<HTMLFormElement>) => {
         e.preventDefault();
         if (!form.first_name) return;
         await supabase.from('profiles').insert({
