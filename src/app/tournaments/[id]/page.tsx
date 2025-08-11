@@ -9,19 +9,24 @@ type Tournament = {
     id: string;
     name: string;
     code: string;
-    [key: string]: any; // Si la table contient d'autres colonnes
+    created_at?: string;
 };
 
 export default function TournamentDetail() {
-    const { id } = useParams<{ id: string }>();
+    const params = useParams<{ id: string }>();
+    const id = params.id;
 
     const [tournament, setTournament] = useState<Tournament | null>(null);
     const [codeInput, setCodeInput] = useState('');
     const [canEdit, setCanEdit] = useState(false);
 
     const loadTournament = useCallback(async () => {
-        const { data } = await supabase.from('tournaments').select('*').eq('id', id).single();
-        setTournament(data as Tournament | null);
+        const { data } = await supabase
+            .from('tournaments')
+            .select('*')
+            .eq('id', id)
+            .single();
+        setTournament((data as Tournament) ?? null);
     }, [id]);
 
     useEffect(() => {
@@ -29,23 +34,16 @@ export default function TournamentDetail() {
     }, [loadTournament]);
 
     useEffect(() => {
-        const savedCode = localStorage.getItem(`code:${id}`);
-        if (savedCode) {
-            setCodeInput(savedCode);
-        }
+        const saved = localStorage.getItem(`code:${id}`);
+        if (saved) setCodeInput(saved);
     }, [id]);
 
     const checkCode = () => {
         if (!tournament) return;
-
-        const isCorrect = codeInput.trim() === tournament.code;
-        setCanEdit(isCorrect);
-
-        if (isCorrect) {
-            localStorage.setItem(`code:${id}`, codeInput.trim());
-        } else {
-            alert('Code incorrect');
-        }
+        const ok = codeInput.trim() === tournament.code;
+        setCanEdit(ok);
+        if (ok) localStorage.setItem(`code:${id}`, codeInput.trim());
+        else alert('Code incorrect');
     };
 
     if (!tournament) {

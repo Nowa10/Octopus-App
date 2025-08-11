@@ -55,6 +55,7 @@ export default function MatchList({
         const { data: ps } = await supabase
             .from('profiles')
             .select('id,first_name,last_name,wins');
+
         const map: Record<string, P> = {};
         (ps || []).forEach((p) => (map[p.id] = p as P));
         setPeople(map);
