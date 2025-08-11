@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { supabase } from '@/lib/supabase';
-import TournamentCreate from '@/components/TournamentCreate';
+import TournamentCreate from '@/app/components/TournamentCreate';
 
 export default function TournamentsPage() {
     const [list, setList] = useState<any[]>([]);
