@@ -186,7 +186,22 @@ export default function MatchList({
         return { min: arr.length ? Math.min(...arr) : 0, max: arr.length ? Math.max(...arr) : 0 };
     }
 
-    async function getParticipantsOrdered(tId: string): Promise<string[]> {
+    // NEW: récupère les participants présents dans TOUT le tournoi (sans dépendre du R1)
+    async function getParticipantsAny(tId: string): Promise<string[]> {
+        const { data } = await supabase
+            .from('matches')
+            .select('player1,player2')
+            .eq('tournament_id', tId);
+        const ids = new Set<string>();
+        (data || []).forEach((m: any) => {
+            if (m.player1) ids.add(m.player1);
+            if (m.player2) ids.add(m.player2);
+        });
+        return [...ids];
+    }
+
+    // Ancienne méthode (R1) — on la garde en fallback
+    async function getParticipantsFromR1(tId: string): Promise<string[]> {
         const { min } = await getAllRounds(tId, 'winner');
         const start = Math.max(1, min || 1);
         const r1 = await fetchRound(tId, 'winner', start);
@@ -205,6 +220,13 @@ export default function MatchList({
             }
         }
         return ordered;
+    }
+
+    // Utilise d’abord “Any”, sinon fallback R1
+    async function getParticipantsOrdered(tId: string): Promise<string[]> {
+        const any = await getParticipantsAny(tId);
+        if (any.length > 0) return any;
+        return await getParticipantsFromR1(tId);
     }
 
     // ===== détection modes =====
@@ -415,15 +437,7 @@ export default function MatchList({
 
     // Poule simple
     async function buildPoolSeed(tId: string): Promise<(string | null)[]> {
-        const { min } = await getAllRounds(tId, 'winner');
-        const start = Math.max(1, min || 1);
-        const r1 = await fetchRound(tId, 'winner', start);
-        r1.sort((a, b) => a.slot - b.slot);
-
-        const firsts = r1.map((m) => m.player1);
-        const seconds = r1.map((m) => m.player2).reverse();
-        const ids = [...firsts, ...seconds].filter((x): x is string => !!x);
-
+        const ids = await getParticipantsOrdered(tId);
         const dedup = Array.from(new Set(ids));
         return dedup.length % 2 === 1 ? [...dedup, null] : dedup;
     }
@@ -576,18 +590,27 @@ export default function MatchList({
             .sort((a, b) => b.wins - a.wins);
     }
 
-    async function detectPoolsBlocks(tId: string) {
-        // Détecte K et rounds {A,B,C,...} à partir de l’intercalage (modulo K)
-        const { max } = await getAllRounds(tId, 'winner');
-        if (!max) return { K: 0, roundsByPool: [] as number[][], playoffsStart: null };
+    // Détection des blocs de poules + début playoffs — appelée après CHAQUE load()
+    const recomputePoolTabs = useCallback(async () => {
+        const { max } = await getAllRounds(tournamentId, 'winner');
+        if (!max) {
+            setPoolTabs({ enabled: false, K: 0, roundsByPool: [], playoffsStart: null, labels: [] });
+            setActivePoolTab(null);
+            return;
+        }
 
         const roundsNonVides: number[] = [];
         for (let r = 1; r <= max; r++) {
-            const ms = await fetchRound(tId, 'winner', r);
+            const ms = await fetchRound(tournamentId, 'winner', r);
             if (ms.length > 0) roundsNonVides.push(r);
         }
-        if (roundsNonVides.length === 0) return { K: 0, roundsByPool: [], playoffsStart: null };
+        if (roundsNonVides.length === 0) {
+            setPoolTabs({ enabled: false, K: 0, roundsByPool: [], playoffsStart: null, labels: [] });
+            setActivePoolTab(null);
+            return;
+        }
 
+        // Estime K (2..4) en cherchant une périodicité “dense”
         let bestK = 0;
         let bestScore = -1;
         for (let K = 2; K <= 4; K++) {
@@ -599,22 +622,33 @@ export default function MatchList({
                 bestK = K;
             }
         }
-        if (bestK === 0) return { K: 0, roundsByPool: [], playoffsStart: null };
+
+        if (bestK === 0) {
+            setPoolTabs({ enabled: false, K: 0, roundsByPool: [], playoffsStart: null, labels: [] });
+            setActivePoolTab(null);
+            return;
+        }
 
         const roundsByPool: number[][] = Array.from({ length: bestK }, () => []);
         for (let i = 0; i < roundsNonVides.length; i++) roundsByPool[i % bestK].push(roundsNonVides[i]);
 
-        // playoffsStart = 1 + max(rounds pools) si derrière on a des rounds supplémentaires
         const lastPoolRound = Math.max(...roundsByPool.flat());
         const playoffsHaveRounds = (await fetchRound(tournamentId, 'winner', lastPoolRound + 1)).length > 0;
         const playoffsStart = playoffsHaveRounds ? lastPoolRound + 1 : null;
 
-        return { K: bestK, roundsByPool, playoffsStart };
-    }
+        const labels = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.slice(0, bestK).split('');
 
+        setPoolTabs({ enabled: true, K: bestK, roundsByPool, playoffsStart, labels });
+        // Si onglet non défini, on ouvre Poule A
+        setActivePoolTab((prev) => prev ?? labels[0] ?? 'Playoffs');
+    }, [tournamentId]);
+
+    // ===== Playoffs depuis poules =====
     async function computeQualifiedFromPools(tId: string) {
-        const { K, roundsByPool } = await detectPoolsBlocks(tId);
-        if (K === 0) return { K: 0, firsts: [] as string[], seconds: [] as string[] };
+        // utilise les données déjà stockées dans poolTabs
+        const K = poolTabs.K;
+        const roundsByPool = poolTabs.roundsByPool;
+        if (!K || roundsByPool.length === 0) return { K: 0, firsts: [] as string[], seconds: [] as string[] };
 
         const firsts: string[] = [];
         const seconds: string[] = [];
@@ -622,9 +656,9 @@ export default function MatchList({
         for (let p = 0; p < K; p++) {
             const rounds = roundsByPool[p];
             if (rounds.length === 0) continue;
-            const ms0 = await fetchRound(tId, 'winner', rounds[0]);
+            const ms0 = await fetchRound(tournamentId, 'winner', rounds[0]);
             const ids = new Set<string>(ms0.flatMap((m) => [m.player1, m.player2]).filter(Boolean) as string[]);
-            const table = await computePoolStandings(tId, rounds, ids);
+            const table = await computePoolStandings(tournamentId, rounds, ids);
             if (table[0]?.id) firsts.push(table[0].id);
             if (table[1]?.id) seconds.push(table[1].id);
         }
@@ -679,9 +713,6 @@ export default function MatchList({
     }
 
     async function tryPropagatePoolsPlayoffs(m: M) {
-        const { max } = await getAllRounds(m.tournament_id, 'winner');
-        if (!max) return;
-
         const currentRoundMatches = await fetchRound(m.tournament_id, 'winner', m.round);
         // QF -> SF (Q=6 or 8)
         if (currentRoundMatches.length >= 2 && currentRoundMatches.length <= 4) {
@@ -841,11 +872,14 @@ export default function MatchList({
 
         setPending({});
         await load();
+        // après chaque changement, on recalcule les onglets poules si besoin
+        await recomputePoolTabs();
     }
 
     const reset = async (m: M) => {
         await resetRecursive(m);
         await load();
+        await recomputePoolTabs();
     };
 
     // ---------- Finir le tournoi + Podium ----------
@@ -925,9 +959,11 @@ export default function MatchList({
             if (playoff.length === 0) {
                 await setPlayersExact(tournamentId, 'winner', totalRounds + 1, 1, first[0], second[0]);
                 await load();
+                await recomputePoolTabs();
             }
             setPodium({
-                note: 'Égalité pour la 1ère place : un match d’appui a été créé. Jouez-le puis cliquez à nouveau sur "Finir le tournoi".',
+                note:
+                    'Égalité pour la 1ère place : un match d’appui a été créé. Jouez-le puis cliquez à nouveau sur "Finir le tournoi".',
             });
             return;
         } else {
@@ -955,31 +991,39 @@ export default function MatchList({
             if (mode === 'pool') {
                 await ensureFullPoolSchedule(tournamentId);
                 await load();
+                await recomputePoolTabs(); // pas d’onglets ici normalement, mais safe
                 setSetupDone(true);
                 return;
             }
 
             if (mode === 'bracket') {
+                await load();
+                await recomputePoolTabs();
                 setSetupDone(true);
                 return;
             }
 
             if (mode === 'hybrid_multi') {
+                // multi‑poules (max 5 par poule) -> playoffs
                 await ensureMultiPoolsSchedule(tournamentId);
+                // on calcule et place les playoffs *immédiatement*, pas besoin d’un 1er match validé
+                await recomputePoolTabs();
                 await ensurePlayoffsFromPools(tournamentId);
                 await load();
-
-                // calcul des onglets de poules (A/B/C + Playoffs)
-                const { K, roundsByPool, playoffsStart } = await detectPoolsBlocks(tournamentId);
-                const labels = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.slice(0, K).split('');
-                setPoolTabs({ enabled: true, K, roundsByPool, playoffsStart, labels });
-                setActivePoolTab(labels[0] || 'Playoffs'); // par défaut on ouvre la 1ère poule
+                await recomputePoolTabs(); // recalcul des onglets + “Playoffs”
                 setSetupDone(true);
                 return;
             }
         })();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [tournamentId, setupDone, tournamentFormat]);
+
+    // Recalcule les onglets quand la liste des matches évolue (ex: validations, resets)
+    useEffect(() => {
+        (async () => {
+            await recomputePoolTabs();
+        })();
+    }, [matches, recomputePoolTabs]);
 
     // =========================================
     // ================= UI ====================
@@ -1070,13 +1114,13 @@ export default function MatchList({
                 ]}
             />
 
-            {/* Onglets par poule (affichés uniquement en hybrid_multi sur le WB) */}
+            {/* Onglets de poules */}
             {activeBracket === 'winner' && poolTabs.enabled && (
                 <Segment
                     value={activePoolTab || ''}
                     onChange={(v) => setActivePoolTab(v as string)}
                     items={[
-                        ...poolTabs.labels.map((L, i) => ({ label: `Poule ${L}`, value: L })),
+                        ...poolTabs.labels.map((L) => ({ label: `Poule ${L}`, value: L })),
                         { label: 'Playoffs', value: 'Playoffs' },
                     ]}
                 />
