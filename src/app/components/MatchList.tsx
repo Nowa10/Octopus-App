@@ -49,7 +49,10 @@ export default function MatchList({
         note?: string;
     } | null>(null);
 
-    // Anti-spam
+    // Pour éviter de régénérer 1000 fois le calendrier de poule
+    const [poolSetupDone, setPoolSetupDone] = useState(false);
+
+    // Anti-spam clic
     const [lastClick, setLastClick] = useState(0);
     function safeAction(fn: () => void) {
         const now = Date.now();
@@ -68,10 +71,7 @@ export default function MatchList({
             .order('slot');
         setMatches(m || []);
 
-        const { data: ps } = await supabase
-            .from('profiles')
-            .select('id,first_name,last_name,wins');
-
+        const { data: ps } = await supabase.from('profiles').select('id,first_name,last_name,wins');
         const map: Record<string, P> = {};
         (ps || []).forEach((p) => (map[p.id] = p as P));
         setPeople(map);
@@ -93,7 +93,7 @@ export default function MatchList({
     const label = (id: string | null) =>
         id ? `${people[id]?.first_name || '?'} ${people[id]?.last_name || ''}` : 'BYE';
 
-    // ------- Bracket UI helpers -------
+    // ------- helpers d’affichage --------
     const bracketMatches = useMemo(
         () => matches.filter((m) => m.bracket_type === activeBracket),
         [matches, activeBracket]
@@ -140,14 +140,14 @@ export default function MatchList({
         return { min: arr.length ? Math.min(...arr) : 0, max: arr.length ? Math.max(...arr) : 0 };
     }
 
-    // ====== Participants & mode ======
+    // Participants dans l’ordre du Round 1 (par slots croissants)
     async function getParticipantsOrdered(tId: string): Promise<string[]> {
-        // On lit le smallest round winner et on récupère l’ordre par slot
         const { min } = await getAllRounds(tId, 'winner');
         const r1 = await fetchRound(tId, 'winner', Math.max(1, min || 1));
+        r1.sort((a, b) => a.slot - b.slot);
         const seen = new Set<string>();
         const ordered: string[] = [];
-        for (const m of r1.sort((a, b) => a.slot - b.slot)) {
+        for (const m of r1) {
             if (m.player1 && !seen.has(m.player1)) {
                 ordered.push(m.player1);
                 seen.add(m.player1);
@@ -215,6 +215,22 @@ export default function MatchList({
         await supabase.from('matches').update({ player1: p1, player2: p2 }).eq('id', m.id);
     }
 
+    async function setBYEAutoWin(
+        tId: string,
+        round: number,
+        slot: number,
+        playerId: string | null
+    ) {
+        if (!playerId) return;
+        const m = await ensureMatch(tId, 'winner', round, slot);
+        // Si déjà joué, on ne réécrit pas
+        if (m.status === 'done') return;
+        await supabase
+            .from('matches')
+            .update({ player1: m.player1, player2: m.player2, winner: playerId, status: 'done' })
+            .eq('id', m.id);
+    }
+
     async function setPlayerOnMatch(
         tId: string,
         bracket: 'winner' | 'loser',
@@ -224,17 +240,14 @@ export default function MatchList({
         prefer: 'player1' | 'player2' | 'auto' = 'auto'
     ) {
         const m = await ensureMatch(tId, bracket, round, slot);
-
         let update: Partial<M> | null = null;
         if (prefer === 'player1') update = { player1: playerId };
         else if (prefer === 'player2') update = { player2: playerId };
         else update = !m.player1 ? { player1: playerId } : { player2: playerId };
-
         await supabase.from('matches').update(update).eq('id', m.id);
     }
 
     // ====== BRACKET (élimination) ======
-
     async function getFirstRoundInfo(tId: string) {
         const { data } = await supabase
             .from('matches')
@@ -320,20 +333,21 @@ export default function MatchList({
         }
     }
 
-    // ====== POULE (round-robin, robuste) ======
+    // ====== POULE (round-robin) ======
 
-    // Seed canonique (Berger) respectant le Round 1 existant (par slots), avec exactement 1 BYE si impair
+    // Construit le “cercle” à partir du Round 1 existant,
+    // de sorte que Round1(algorithme) == Round1(DB).
     async function buildPoolSeed(tId: string): Promise<(string | null)[]> {
         const { min } = await getAllRounds(tId, 'winner');
         const r1 = await fetchRound(tId, 'winner', Math.max(1, min || 1));
-        // pairs du round 1 triés par slot
         r1.sort((a, b) => a.slot - b.slot);
-        const firsts = r1.map((m) => m.player1);
-        const seconds = r1.map((m) => m.player2).reverse(); // pour que R1(DB) == R1(Berger)
-        const ids = [...firsts, ...seconds].filter((x): x is string | null => true);
 
-        // Normalisation: un seul BYE si impair
+        const firsts = r1.map((m) => m.player1);
+        const seconds = r1.map((m) => m.player2).reverse(); // clé pour coller au Round 1 affiché
+        const ids = [...firsts, ...seconds];
+
         const players = ids.filter((x): x is string => !!x);
+        // nombre impair -> ajouter un BYE (null)
         if (players.length % 2 === 1) return [...players, null];
         return players;
     }
@@ -356,122 +370,49 @@ export default function MatchList({
         return pairs;
     }
 
-    function pairKey(a: string | null, b: string | null) {
-        if (!a || !b) return '';             // pas de clé pour un BYE
-        return [a, b].sort().join('|');
-    }
-
-    async function getStartRound(tId: string) {
-        const { min } = await getAllRounds(tId, 'winner');
-        return Math.max(1, min || 1);
-    }
-
-    // Toutes les paires déjà jouées jusqu’à `uptoRound` inclus
-    async function playedPairsUntil(tId: string, uptoRound: number) {
-        const start = await getStartRound(tId);
-        const keys = new Set<string>();
-        for (let r = start; r <= Math.max(start, uptoRound); r++) {
-            const ms = await fetchRound(tId, 'winner', r);
-            ms.forEach(m => keys.add(pairKey(m.player1, m.player2)));
-        }
-        return keys;
-    }
-
-    // Compte des BYE pour chaque joueur jusqu’au round-1
-    async function countByesUpToRound(tId: string, uptoRound: number) {
-        const start = await getStartRound(tId);
-        const counts = new Map<string, number>();
-        for (let r = start; r < uptoRound; r++) {
-            const ms = await fetchRound(tId, 'winner', r);
-            for (const m of ms) {
-                if (m.player1 && !m.player2) counts.set(m.player1, (counts.get(m.player1) || 0) + 1);
-                if (m.player2 && !m.player1) counts.set(m.player2, (counts.get(m.player2) || 0) + 1);
-            }
-        }
-        return counts;
-    }
-
     async function getPoolTotalRounds(tId: string): Promise<number> {
         const ids = await getParticipantsOrdered(tId);
-        const nWithBye = ids.length % 2 === 0 ? ids.length : ids.length + 1;
-        return Math.max(1, nWithBye - 1);
+        const n = ids.length % 2 === 0 ? ids.length : ids.length + 1;
+        return Math.max(1, n - 1);
     }
 
-    // Crée/écrit le round N (évite rematch immédiat + équilibre BYE)
-    async function ensurePoolRound(tId: string, round: number) {
-        const seed = await buildPoolSeed(tId);           // joueurs + éventuellement null
-        const total = Math.max(1, seed.length - 1);
-        if (round < 1 || round > total) return;
-
-        const expectedBye = seed.includes(null) ? 1 : 0;
-        const allPrevPairs = await playedPairsUntil(tId, round - 1);
-        const byeCounts = await countByesUpToRound(tId, round);
-        const players = seed.filter(Boolean) as string[];
-        const minBye = players.reduce((m, p) => Math.min(m, byeCounts.get(p) || 0), Infinity);
-        const minByeSet = new Set(players.filter(p => (byeCounts.get(p) || 0) === minBye));
+    // Génère TOUT le calendrier de poule en une fois (idempotent)
+    async function ensureFullPoolSchedule(tId: string) {
+        const seed = await buildPoolSeed(tId);
+        if (seed.length < 2) return;
+        const total = seed.length - 1;
 
         let circle = seed.slice();
-        // on essaye plusieurs rotations jusqu’à satisfaire les contraintes
-        for (let tries = 0; tries < circle.length * 2; tries++) {
+        for (let round = 1; round <= total; round++) {
+            // round 1: cercle tel quel ; round k: (k-1) rotations
+            if (round > 1) circle = rotateOnce(circle);
             const pairs = pairsFromCircle(circle);
 
-            // 1) aucune paire déjà jouée
-            const duplicate = pairs.some(([a, b]) => {
-                const k = pairKey(a, b);
-                return k && allPrevPairs.has(k);
-            });
-
-            // 2) BYE donné uniquement à un joueur au minimum actuel
-            let byeOk = expectedBye === 0;
-            const byePair = pairs.find(([a, b]) => a === null || b === null);
-            if (expectedBye === 1) {
-                if (!byePair) byeOk = false;
-                else {
-                    const byePlayer = (byePair[0] || byePair[1]) as string;
-                    byeOk = minByeSet.has(byePlayer);
+            let slot = 1;
+            for (const [a, b] of pairs) {
+                await setPlayersExact(tId, 'winner', round, slot, a, b);
+                // BYE => victoire auto pour le joueur non nul
+                if ((a && !b) || (!a && b)) {
+                    await setBYEAutoWin(tId, round, slot, (a || b) as string);
                 }
-            }
-
-            if (!duplicate && byeOk) {
-                let slot = 1;
-                for (const [a, b] of pairs) {
-                    await setPlayersExact(tId, 'winner', round, slot, a, b);
-                    slot++;
-                }
-                return;
-            }
-            circle = rotateOnce(circle);
-        }
-
-        // Fallback (ne devrait pas se produire)
-        let slot = 1;
-        for (const [a, b] of pairsFromCircle(circle)) {
-            await setPlayersExact(tId, 'winner', round, slot, a, b);
-            slot++;
-        }
-    }
-
-    // Avance la poule round-par-round
-    async function ensurePoolProgress(tId: string) {
-        const seed = await buildPoolSeed(tId);
-        const total = Math.max(1, seed.length - 1);
-        const { min, max } = await getAllRounds(tId, 'winner');
-        const start = Math.max(1, min || 1);
-        const currentMax = Math.max(max, start);
-
-        for (let r = start; r <= currentMax; r++) {
-            const curr = await fetchRound(tId, 'winner', r);
-            if (curr.length === 0) break;
-            const allDone = curr.every((m) => m.status === 'done');
-            if (!allDone) return;
-            if (r - start + 1 < total) {
-                const next = await fetchRound(tId, 'winner', r + 1);
-                if (next.length === 0) {
-                    await ensurePoolRound(tId, r + 1);
-                }
+                slot++;
             }
         }
     }
+
+    // Au premier chargement en mode poule, on génère le calendrier complet
+    useEffect(() => {
+        (async () => {
+            if (poolSetupDone) return;
+            const bracket = await isBracketMode(tournamentId);
+            if (!bracket) {
+                await ensureFullPoolSchedule(tournamentId);
+                await load();
+            }
+            setPoolSetupDone(true);
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [tournamentId, poolSetupDone]);
 
     // ---------- Application d’un vainqueur ----------
     async function applyWinner(m: M, winnerId: string) {
@@ -486,7 +427,6 @@ export default function MatchList({
             if (m.bracket_type === 'winner') {
                 const plannedMax = await getPlannedWinnerFinalRound(m.tournament_id);
                 const isFinal = m.round === plannedMax;
-
                 if (!isFinal) await propagateWinnerWB(m, winnerId);
                 if (loserId) {
                     const qfRound = plannedMax - 2;
@@ -510,8 +450,8 @@ export default function MatchList({
                 await supabase.from('profiles').update({ wins: current + 1 }).eq('id', winnerId);
             }
         } else {
-            // POULE : on débloque le round suivant uniquement quand le courant est terminé
-            await ensurePoolProgress(m.tournament_id);
+            // en poule, le calendrier est déjà complet ; rien de spécial ici
+            // (on laisse juste l’UI se rafraîchir)
         }
     }
 
@@ -554,7 +494,6 @@ export default function MatchList({
     async function computePodium() {
         const isBracket = await isBracketMode(tournamentId);
 
-        // ===== Bracket
         if (isBracket) {
             const { max } = await getAllRounds(tournamentId, 'winner');
             let gold: string | null | undefined = null;
@@ -580,7 +519,7 @@ export default function MatchList({
                     .eq('round', 3)
                     .eq('slot', 1)
                     .limit(1);
-                const lb = (lb3?.[0] as M | undefined);
+                const lb = lb3?.[0] as M | undefined;
                 if (lb && lb.status === 'done' && lb.winner) {
                     bronze = lb.winner;
                     const opp = lb.winner === lb.player1 ? lb.player2 : lb.player1;
@@ -592,7 +531,7 @@ export default function MatchList({
             return;
         }
 
-        // ===== Poule : classement victoires + éventuel match d’appui
+        // ===== Poule : classement par victoires (+ éventuel match d’appui)
         const totalRounds = await getPoolTotalRounds(tournamentId);
 
         // Play-off déjà joué ?
@@ -611,7 +550,7 @@ export default function MatchList({
             return;
         }
 
-        // Classement par victoires (winner bracket uniquement)
+        // Classement par victoires (winner uniquement)
         const { data: all } = await supabase
             .from('matches')
             .select('winner,status')
@@ -741,7 +680,8 @@ export default function MatchList({
                     </button>
                     <button onClick={() => safeAction(clearPending)}>Annuler</button>
                 </div>
-            )}
+            )
+            }
 
             {/* Switch Winner / Loser */}
             <div style={{ display: 'flex', gap: 8 }}>
@@ -769,7 +709,7 @@ export default function MatchList({
                 </button>
             </div>
 
-            {/* Grille en colonnes par round */}
+            {/* Grille par rounds */}
             <div
                 style={{
                     display: 'grid',
@@ -888,6 +828,6 @@ export default function MatchList({
                     </div>
                 ))}
             </div>
-        </div>
+        </div >
     );
 }
