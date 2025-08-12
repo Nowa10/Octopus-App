@@ -192,12 +192,17 @@ export default function MatchList({
             .from('matches')
             .select('player1,player2')
             .eq('tournament_id', tId);
+
+        type PlayerPair = Pick<M, 'player1' | 'player2'>;
+        const rows: PlayerPair[] = (data || []) as PlayerPair[];
+
         const ids = new Set<string>();
-        (data || []).forEach((m: any) => {
+        rows.forEach((m) => {
             if (m.player1) ids.add(m.player1);
             if (m.player2) ids.add(m.player2);
         });
         return [...ids];
+
     }
 
     // Ancienne méthode (R1) — on la garde en fallback
@@ -644,7 +649,7 @@ export default function MatchList({
     }, [tournamentId]);
 
     // ===== Playoffs depuis poules =====
-    async function computeQualifiedFromPools(tId: string) {
+    async function computeQualifiedFromPools() {
         // utilise les données déjà stockées dans poolTabs
         const K = poolTabs.K;
         const roundsByPool = poolTabs.roundsByPool;
@@ -666,7 +671,7 @@ export default function MatchList({
     }
 
     async function ensurePlayoffsFromPools(tId: string) {
-        const { K, firsts, seconds } = await computeQualifiedFromPools(tId);
+        const { K, firsts, seconds } = await computeQualifiedFromPools();
         if (K === 0) return;
         const Q = firsts.length + seconds.length; // 2K
 
