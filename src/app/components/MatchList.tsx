@@ -99,6 +99,48 @@ export default function MatchList({
         [matches, activeBracket]
     );
 
+    // Participants (synchro localement depuis le Round 1 du winner bracket)
+    const participantsFromState = useMemo(() => {
+        const wb = matches.filter((m) => m.bracket_type === 'winner');
+        if (wb.length === 0) return [] as string[];
+        const minRound = Math.min(...wb.map((m) => m.round));
+        const r1 = wb
+            .filter((m) => m.round === minRound)
+            .sort((a, b) => a.slot - b.slot);
+        const seen = new Set<string>();
+        const ordered: string[] = [];
+        for (const m of r1) {
+            if (m.player1 && !seen.has(m.player1)) {
+                ordered.push(m.player1);
+                seen.add(m.player1);
+            }
+            if (m.player2 && !seen.has(m.player2)) {
+                ordered.push(m.player2);
+                seen.add(m.player2);
+            }
+        }
+        return ordered;
+    }, [matches]);
+
+    const isBracketFromState = useMemo(
+        () => participantsFromState.length > 6,
+        [participantsFromState]
+    );
+
+    const totalPoolRoundsFromState = useMemo(() => {
+        const n = participantsFromState.length;
+        const nWithBye = n % 2 === 0 ? n : n + 1;
+        return Math.max(1, nWithBye - 1);
+    }, [participantsFromState]);
+
+    const roundTitle = useCallback(
+        (roundIdx: number) => {
+            if (!isBracketFromState && roundIdx === totalPoolRoundsFromState + 1) return 'Finale poule';
+            return `Round ${roundIdx}`;
+        },
+        [isBracketFromState, totalPoolRoundsFromState]
+    );
+
     const rounds = useMemo(() => {
         const byRound = new Map<number, M[]>();
         for (const m of bracketMatches) {
@@ -223,7 +265,6 @@ export default function MatchList({
     ) {
         if (!playerId) return;
         const m = await ensureMatch(tId, 'winner', round, slot);
-        // Si déjà joué, on ne réécrit pas
         if (m.status === 'done') return;
         await supabase
             .from('matches')
@@ -335,19 +376,16 @@ export default function MatchList({
 
     // ====== POULE (round-robin) ======
 
-    // Construit le “cercle” à partir du Round 1 existant,
-    // de sorte que Round1(algorithme) == Round1(DB).
     async function buildPoolSeed(tId: string): Promise<(string | null)[]> {
         const { min } = await getAllRounds(tId, 'winner');
         const r1 = await fetchRound(tId, 'winner', Math.max(1, min || 1));
         r1.sort((a, b) => a.slot - b.slot);
 
         const firsts = r1.map((m) => m.player1);
-        const seconds = r1.map((m) => m.player2).reverse(); // clé pour coller au Round 1 affiché
+        const seconds = r1.map((m) => m.player2).reverse();
         const ids = [...firsts, ...seconds];
 
         const players = ids.filter((x): x is string => !!x);
-        // nombre impair -> ajouter un BYE (null)
         if (players.length % 2 === 1) return [...players, null];
         return players;
     }
@@ -384,14 +422,12 @@ export default function MatchList({
 
         let circle = seed.slice();
         for (let round = 1; round <= total; round++) {
-            // round 1: cercle tel quel ; round k: (k-1) rotations
             if (round > 1) circle = rotateOnce(circle);
             const pairs = pairsFromCircle(circle);
 
             let slot = 1;
             for (const [a, b] of pairs) {
                 await setPlayersExact(tId, 'winner', round, slot, a, b);
-                // BYE => victoire auto pour le joueur non nul
                 if ((a && !b) || (!a && b)) {
                     await setBYEAutoWin(tId, round, slot, (a || b) as string);
                 }
@@ -450,8 +486,7 @@ export default function MatchList({
                 await supabase.from('profiles').update({ wins: current + 1 }).eq('id', winnerId);
             }
         } else {
-            // en poule, le calendrier est déjà complet ; rien de spécial ici
-            // (on laisse juste l’UI se rafraîchir)
+            // en poule, tout est déjà planifié
         }
     }
 
@@ -573,13 +608,13 @@ export default function MatchList({
             // créer match d’appui si absent
             if (playoff.length === 0) {
                 await setPlayersExact(tournamentId, 'winner', totalRounds + 1, 1, first[0], second[0]);
-                await load(); // <-- rafraîchir pour afficher le nouveau round/match
+                await load(); // afficher le nouveau round
             }
             setPodium({
                 note:
                     'Égalité pour la 1ère place : un match d’appui a été créé. Jouez-le puis cliquez à nouveau sur "Finir le tournoi".',
             });
-            return; // optionnel: on sort ici
+            return;
         } else {
             setPodium({
                 gold: first?.[0] ?? null,
@@ -594,6 +629,12 @@ export default function MatchList({
         if (pendingCount > 0) await confirmPending();
         await computePodium();
     }
+
+    // ==== Fin réellement actée ? (empêche les clics seulement quand médailles fixées)
+    const tournamentFinished = useMemo(() => {
+        if (!podium) return false;
+        return Boolean(podium.gold || podium.silver || podium.bronze || podium.fourth);
+    }, [podium]);
 
     // =========================================
     // ================= UI ====================
@@ -682,8 +723,7 @@ export default function MatchList({
                     </button>
                     <button onClick={() => safeAction(clearPending)}>Annuler</button>
                 </div>
-            )
-            }
+            )}
 
             {/* Switch Winner / Loser */}
             <div style={{ display: 'flex', gap: 8 }}>
@@ -735,7 +775,7 @@ export default function MatchList({
                                 paddingBottom: 4,
                             }}
                         >
-                            Round {roundIdx}
+                            {roundTitle(roundIdx)}
                         </div>
 
                         {items.map((m) => {
@@ -775,7 +815,7 @@ export default function MatchList({
                                             }}
                                         >
                                             <span>{label(m.player1)}</span>
-                                            {canEdit && m.player1 && m.status !== 'done' && !podium && (
+                                            {canEdit && m.player1 && m.status !== 'done' && !tournamentFinished && (
                                                 <button onClick={() => safeAction(() => selectWinner(m, m.player1 as string))}>
                                                     Gagnant
                                                 </button>
@@ -799,7 +839,7 @@ export default function MatchList({
                                             }}
                                         >
                                             <span>{label(m.player2)}</span>
-                                            {canEdit && m.player2 && m.status !== 'done' && !podium && (
+                                            {canEdit && m.player2 && m.status !== 'done' && !tournamentFinished && (
                                                 <button onClick={() => safeAction(() => selectWinner(m, m.player2 as string))}>
                                                     Gagnant
                                                 </button>
@@ -818,7 +858,7 @@ export default function MatchList({
                                         ) : (
                                             <div style={{ opacity: 0.7 }}>—</div>
                                         )}
-                                        {canEdit && !podium && (
+                                        {canEdit && !tournamentFinished && (
                                             <button style={{ marginLeft: 'auto' }} onClick={() => safeAction(() => reset(m))}>
                                                 Réinitialiser
                                             </button>
@@ -830,6 +870,6 @@ export default function MatchList({
                     </div>
                 ))}
             </div>
-        </div >
+        </div>
     );
 }
