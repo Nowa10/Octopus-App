@@ -25,7 +25,8 @@ export function Segment({
     return (
         <div className="segment">
             {items.map(it => (
-                <button key={it.value}
+                <button
+                    key={it.value}
                     className="segment__btn"
                     aria-pressed={value === it.value}
                     onClick={() => onChange(it.value)}

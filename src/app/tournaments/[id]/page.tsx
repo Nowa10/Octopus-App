@@ -4,13 +4,9 @@ import { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import MatchList from '@/app/components/MatchList';
+import { Button, Card } from '@/app/components/ui';
 
-type Tournament = {
-    id: string;
-    name: string;
-    code: string;
-    created_at?: string;
-};
+type Tournament = { id: string; name: string; code: string; created_at?: string };
 
 export default function TournamentDetail() {
     const params = useParams<{ id: string }>();
@@ -21,17 +17,11 @@ export default function TournamentDetail() {
     const [canEdit, setCanEdit] = useState(false);
 
     const loadTournament = useCallback(async () => {
-        const { data } = await supabase
-            .from('tournaments')
-            .select('*')
-            .eq('id', id)
-            .single();
+        const { data } = await supabase.from('tournaments').select('*').eq('id', id).single();
         setTournament((data as Tournament) ?? null);
     }, [id]);
 
-    useEffect(() => {
-        loadTournament();
-    }, [loadTournament]);
+    useEffect(() => { loadTournament(); }, [loadTournament]);
 
     useEffect(() => {
         const saved = localStorage.getItem(`code:${id}`);
@@ -46,29 +36,29 @@ export default function TournamentDetail() {
         else alert('Code incorrect');
     };
 
-    if (!tournament) {
-        return <main style={{ padding: 20 }}>Chargement…</main>;
-    }
+    if (!tournament) return <main>Chargement…</main>;
 
     return (
-        <main style={{ display: 'grid', gap: 16, padding: 20, maxWidth: 900 }}>
-            <h1>{tournament.name}</h1>
+        <>
+            <h1 className="section-title">{tournament.name}</h1>
 
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <input
-                    placeholder="Entrer le code pour modifier"
-                    value={codeInput}
-                    onChange={(e) => setCodeInput(e.target.value)}
-                />
-                <button onClick={checkCode}>Valider</button>
-                {canEdit && <span style={{ color: 'green' }}>Mode édition</span>}
-            </div>
-
-            <p style={{ opacity: 0.7 }}>
-                Sans code : lecture seule. Avec code : tu peux marquer les vainqueurs, etc.
-            </p>
+            <Card title="Mode édition">
+                <div className="hstack">
+                    <input
+                        className="input"
+                        placeholder="Entrer le code pour modifier"
+                        value={codeInput}
+                        onChange={(e) => setCodeInput(e.target.value)}
+                    />
+                    <Button variant="primary" onClick={checkCode}>Valider</Button>
+                    {canEdit && <span className="badge">Mode édition</span>}
+                </div>
+                <div style={{ opacity: .7, marginTop: 8 }}>
+                    Sans code : lecture seule. Avec code : tu peux marquer les vainqueurs, etc.
+                </div>
+            </Card>
 
             <MatchList tournamentId={id} canEdit={canEdit} />
-        </main>
+        </>
     );
 }
