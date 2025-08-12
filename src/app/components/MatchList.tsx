@@ -22,7 +22,7 @@ type M = {
     winner: string | null;
 };
 
-type MinimalMatchRow = Pick<M, 'winner' | 'status' | 'tournament_id'>;
+type MinimalMatchRow = Pick<M, 'winner' | 'status'>;
 
 export default function MatchList({
     tournamentId,
@@ -40,7 +40,7 @@ export default function MatchList({
     const [pending, setPending] = useState<Record<string, string>>({});
     const pendingCount = Object.keys(pending).length;
 
-    // Podium (après "Finir le tournoi")
+    // Podium
     const [podium, setPodium] = useState<{
         gold?: string | null;
         silver?: string | null;
@@ -142,7 +142,6 @@ export default function MatchList({
 
     // ====== Participants & mode ======
     async function getParticipantsOrdered(tId: string): Promise<string[]> {
-        // On lit le plus petit round du bracket "winner", puis on prend les joueurs dans l’ordre des slots
         const { min } = await getAllRounds(tId, 'winner');
         const r1 = await fetchRound(tId, 'winner', Math.max(1, min || 1));
         const seen = new Set<string>();
@@ -160,8 +159,8 @@ export default function MatchList({
         return ordered;
     }
 
+    // > 6 => bracket ; ≤ 6 => poule
     async function isBracketMode(tId: string): Promise<boolean> {
-        // Seuil explicitement demandé : > 6 => bracket ; sinon poule
         const parts = await getParticipantsOrdered(tId);
         return parts.length > 6;
     }
@@ -322,21 +321,22 @@ export default function MatchList({
 
     // ====== POULE (round-robin) ======
 
-    // Construit l'arrangement initial du "cercle" à partir du Round 1 existant
+    // Normalise le cercle: conserve l’ordre, garde **exactement un** BYE si nb impaire
+    function normalizeCircle(list: (string | null)[]): (string | null)[] {
+        const ids = list.filter((x): x is string => !!x);
+        // si nb impaire -> on ajoute un BYE (null)
+        if (ids.length % 2 === 1) return [...ids, null];
+        // nb paire -> pas de BYE
+        return ids;
+    }
+
+    // Construit l'arrangement initial à partir du Round 1 existant
     async function buildInitialCircle(tId: string): Promise<(string | null)[]> {
         const { min } = await getAllRounds(tId, 'winner');
         const r1 = await fetchRound(tId, 'winner', Math.max(1, min || 1));
         const firsts = r1.map((m) => m.player1);
         const seconds = r1.map((m) => m.player2).reverse();
-        let arr = [...firsts, ...seconds]; // garantit que Round 1 correspond à l’algorithme
-        // Si nombre de joueurs impair, on garde un seul null (BYE)
-        const hasNull = arr.some((x) => x === null);
-        if (!hasNull && arr.length % 2 === 1) arr = [...arr, null];
-        if (hasNull && arr.length % 2 === 0) {
-            // si la seed ajoute null + nb pair, on retire un null superflu
-            const i = arr.findIndex((x) => x === null);
-            if (i >= 0) arr.splice(i, 1);
-        }
+        const arr = normalizeCircle([...firsts, ...seconds]);
         return arr;
     }
 
@@ -370,13 +370,9 @@ export default function MatchList({
         if (round < 1 || round > total) return;
 
         let circle = await buildInitialCircle(tId);
-        // round 1 = pas de rotation ; round k => (k-1) rotations
-        for (let r = 2; r <= round; r++) {
-            circle = rotateOnce(circle);
-        }
+        for (let r = 2; r <= round; r++) circle = rotateOnce(circle);
         const pairs = pairsFromCircle(circle);
 
-        // Écrit toutes les paires
         let slot = 1;
         for (const [a, b] of pairs) {
             await setPlayersExact(tId, 'winner', round, slot, a, b);
@@ -389,18 +385,14 @@ export default function MatchList({
         const total = await getPoolTotalRounds(tId);
         const { min, max } = await getAllRounds(tId, 'winner');
         const start = Math.max(1, min || 1);
-        // Parcourt les rounds existants dans l’ordre
         for (let r = start; r <= Math.max(max, start); r++) {
             const curr = await fetchRound(tId, 'winner', r);
-            if (curr.length === 0) break; // rien à faire
+            if (curr.length === 0) break;
             const allDone = curr.every((m) => m.status === 'done');
-            if (!allDone) return; // on attend la fin du round courant
-            // round fini → si le suivant n’existe pas et reste dans la limite, on le crée
+            if (!allDone) return;
             if (r - start + 1 < total) {
                 const next = await fetchRound(tId, 'winner', r + 1);
-                if (next.length === 0) {
-                    await ensurePoolRound(tId, r + 1);
-                }
+                if (next.length === 0) await ensurePoolRound(tId, r + 1);
             }
         }
     }
@@ -409,10 +401,8 @@ export default function MatchList({
     async function applyWinner(m: M, winnerId: string) {
         const loserId = m.player1 === winnerId ? m.player2 : m.player1;
 
-        // 1) marquer le match
         await supabase.from('matches').update({ winner: winnerId, status: 'done' }).eq('id', m.id);
 
-        // 2) selon le mode
         const bracket = await isBracketMode(m.tournament_id);
         if (bracket) {
             await ensureLoserSkeleton(m.tournament_id);
@@ -421,10 +411,7 @@ export default function MatchList({
                 const plannedMax = await getPlannedWinnerFinalRound(m.tournament_id);
                 const isFinal = m.round === plannedMax;
 
-                if (!isFinal) {
-                    await propagateWinnerWB(m, winnerId);
-                }
-
+                if (!isFinal) await propagateWinnerWB(m, winnerId);
                 if (loserId) {
                     const qfRound = plannedMax - 2;
                     const sfRound = plannedMax - 1;
@@ -435,7 +422,6 @@ export default function MatchList({
                 await propagateWinnerLB(m, winnerId);
             }
 
-            // bonus palmarès si finale WB
             const plannedMax2 = await getPlannedWinnerFinalRound(m.tournament_id);
             const isFinal2 = m.bracket_type === 'winner' && m.round === plannedMax2;
             if (isFinal2) {
@@ -448,7 +434,7 @@ export default function MatchList({
                 await supabase.from('profiles').update({ wins: current + 1 }).eq('id', winnerId);
             }
         } else {
-            // POULE : on crée le prochain round uniquement quand tout le round courant est terminé
+            // POULE : on débloque le round suivant uniquement quand le courant est terminé
             await ensurePoolProgress(m.tournament_id);
         }
     }
@@ -464,7 +450,6 @@ export default function MatchList({
     async function confirmPending() {
         if (pendingCount === 0) return;
 
-        // Appliquer dans un ordre stable
         const items: { m: M; winnerId: string }[] = [];
         for (const [matchId, winnerId] of Object.entries(pending)) {
             const m = matches.find((x) => x.id === matchId);
@@ -478,12 +463,10 @@ export default function MatchList({
             return a.m.slot - b.m.slot;
         });
 
-        for (const it of items) {
-            await applyWinner(it.m, it.winnerId);
-        }
+        for (const it of items) await applyWinner(it.m, it.winnerId);
 
         setPending({});
-        await load(); // => si un nouveau round a été créé, il s’affiche aussitôt
+        await load();
     }
 
     const reset = async (m: M) => {
@@ -493,93 +476,106 @@ export default function MatchList({
 
     // ---------- Finir le tournoi + Podium ----------
     async function computePodium() {
-        // 1) Bracket : via finale WB + petite finale LB
-        const { max } = await getAllRounds(tournamentId, 'winner');
-        let gold: string | null | undefined = null;
-        let silver: string | null | undefined = null;
-        let bronze: string | null | undefined = null;
-        let fourth: string | null | undefined = null;
-        let note = '';
+        const isBracket = await isBracketMode(tournamentId);
 
-        if (max > 0) {
-            const finals = await fetchRound(tournamentId, 'winner', max);
-            if (finals.length >= 1) {
-                const f = finals[0];
-                if (f.status === 'done' && f.winner) {
-                    gold = f.winner;
-                    const opp = f.winner === f.player1 ? f.player2 : f.player1;
-                    silver = opp || null;
+        // ===== Bracket : finale WB + petite finale LB
+        if (isBracket) {
+            const { max } = await getAllRounds(tournamentId, 'winner');
+            let gold: string | null | undefined = null;
+            let silver: string | null | undefined = null;
+            let bronze: string | null | undefined = null;
+            let fourth: string | null | undefined = null;
+
+            if (max > 0) {
+                const finals = await fetchRound(tournamentId, 'winner', max);
+                if (finals.length >= 1) {
+                    const f = finals[0];
+                    if (f.status === 'done' && f.winner) {
+                        gold = f.winner;
+                        const opp = f.winner === f.player1 ? f.player2 : f.player1;
+                        silver = opp || null;
+                    }
+                }
+                const { data: lb3 } = await supabase
+                    .from('matches')
+                    .select('*')
+                    .eq('tournament_id', tournamentId)
+                    .eq('bracket_type', 'loser')
+                    .eq('round', 3)
+                    .eq('slot', 1)
+                    .limit(1);
+                const lb = lb3?.[0] as M | undefined;
+                if (lb && lb.status === 'done' && lb.winner) {
+                    bronze = lb.winner;
+                    const opp = lb.winner === lb.player1 ? lb.player2 : lb.player1;
+                    fourth = opp || null;
                 }
             }
-            const { data: lb3 } = await supabase
-                .from('matches')
-                .select('*')
-                .eq('tournament_id', tournamentId)
-                .eq('bracket_type', 'loser')
-                .eq('round', 3)
-                .eq('slot', 1)
-                .limit(1);
-            const lb = lb3?.[0] as M | undefined;
-            if (lb && lb.status === 'done' && lb.winner) {
-                bronze = lb.winner;
-                const opp = lb.winner === lb.player1 ? lb.player2 : lb.player1;
-                fourth = opp || null;
-            }
+
+            setPodium({ gold, silver, bronze, fourth });
+            return;
         }
 
-        // 2) Fallback poule : classement par nb de victoires + match d’appui si égalité 1er/2e
-        if (!gold) {
-            note = 'Classement calculé par nombre total de victoires (format poule).';
-            const { data: all } = await supabase
-                .from('matches')
-                .select('winner,status,tournament_id')
-                .eq('tournament_id', tournamentId);
+        // ===== Poule : classe par victoires + match d’appui si égalité 1er/2e
+        const totalRounds = await getPoolTotalRounds(tournamentId);
 
-            const rows: MinimalMatchRow[] = (all || []) as MinimalMatchRow[];
-
-            const wins = new Map<string, number>();
-            rows.forEach((mm) => {
-                if (mm.status === 'done' && mm.winner) {
-                    wins.set(mm.winner, (wins.get(mm.winner) || 0) + 1);
-                }
+        // s'il existe un round "play-off" (totalRounds+1), et qu'il est joué, on l'utilise
+        const playoff = await fetchRound(tournamentId, 'winner', totalRounds + 1);
+        if (playoff.length >= 1 && playoff[0].status === 'done') {
+            const f = playoff[0];
+            const gold = f.winner;
+            const silver = f.winner === f.player1 ? f.player2 : f.player1;
+            setPodium({
+                gold: gold ?? null,
+                silver: silver ?? null,
+                bronze: null,
+                fourth: null,
+                note: 'Résultat du match d’appui.',
             });
-
-            const ordered = [...wins.entries()].sort((a, b) => b[1] - a[1]);
-            const first = ordered[0];
-            const second = ordered[1];
-
-            if (first && second && first[1] === second[1]) {
-                // égalité 1er/2e => on propose/assure un match d’appui
-                note =
-                    'Égalité pour la 1ère place : un match d’appui est requis entre les deux premiers.';
-                // on crée (si absent) un match "Finale poule" round max+1, slot 1
-                const { max: winnerMax } = await getAllRounds(tournamentId, 'winner');
-                const playOffRound = (winnerMax || 0) + 1;
-                const existing = await fetchRound(tournamentId, 'winner', playOffRound);
-                if (existing.length === 0) {
-                    await setPlayersExact(
-                        tournamentId,
-                        'winner',
-                        playOffRound,
-                        1,
-                        first[0],
-                        second[0]
-                    );
-                }
-            } else {
-                gold = first?.[0] ?? null;
-                silver = second?.[0] ?? null;
-                bronze = ordered[2]?.[0] ?? null;
-            }
+            return;
         }
 
-        setPodium({ gold, silver, bronze, fourth, note });
+        // sinon, classement par victoires sur le bracket winner uniquement
+        const { data: all } = await supabase
+            .from('matches')
+            .select('winner,status')
+            .eq('tournament_id', tournamentId)
+            .eq('bracket_type', 'winner');
+
+        const rows: MinimalMatchRow[] = (all || []) as MinimalMatchRow[];
+        const wins = new Map<string, number>();
+        rows.forEach((mm) => {
+            if (mm.status === 'done' && mm.winner) {
+                wins.set(mm.winner, (wins.get(mm.winner) || 0) + 1);
+            }
+        });
+
+        const ordered = [...wins.entries()].sort((a, b) => b[1] - a[1]);
+        const first = ordered[0];
+        const second = ordered[1];
+
+        if (first && second && first[1] === second[1]) {
+            // égalité -> créer le match d’appui si absent
+            const existing = await fetchRound(tournamentId, 'winner', totalRounds + 1);
+            if (existing.length === 0) {
+                await setPlayersExact(tournamentId, 'winner', totalRounds + 1, 1, first[0], second[0]);
+            }
+            setPodium({
+                note:
+                    'Égalité pour la 1ère place : un match d’appui a été créé. Jouez-le puis cliquez à nouveau sur "Finir le tournoi".',
+            });
+        } else {
+            setPodium({
+                gold: first?.[0] ?? null,
+                silver: second?.[0] ?? null,
+                bronze: ordered[2]?.[0] ?? null,
+                note: 'Classement calculé par nombre total de victoires.',
+            });
+        }
     }
 
     async function finishTournament() {
-        if (pendingCount > 0) {
-            await confirmPending();
-        }
+        if (pendingCount > 0) await confirmPending();
         await computePodium();
     }
 
@@ -601,9 +597,9 @@ export default function MatchList({
                     }}
                 >
                     <div style={{ fontWeight: 700 }}>🏁 Tournoi terminé — Podium</div>
-                    <div>🥇 1er : <b>{label(podium.gold ?? null)}</b></div>
-                    <div>🥈 2e : <b>{label(podium.silver ?? null)}</b></div>
-                    <div>🥉 3e : <b>{label(podium.bronze ?? null)}</b></div>
+                    {'gold' in (podium || {}) && <div>🥇 1er : <b>{label(podium.gold ?? null)}</b></div>}
+                    {'silver' in (podium || {}) && <div>🥈 2e : <b>{label(podium.silver ?? null)}</b></div>}
+                    {'bronze' in (podium || {}) && <div>🥉 3e : <b>{label(podium.bronze ?? null)}</b></div>}
                     {podium.fourth && <div>4e : <b>{label(podium.fourth)}</b></div>}
                     {podium.note && <div style={{ opacity: 0.8, fontSize: 12 }}>{podium.note}</div>}
                 </div>
