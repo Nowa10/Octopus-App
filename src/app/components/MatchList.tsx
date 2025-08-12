@@ -22,6 +22,8 @@ type M = {
     winner: string | null;
 };
 
+type MinimalMatchRow = Pick<M, 'winner' | 'status' | 'tournament_id'>;
+
 export default function MatchList({
     tournamentId,
     canEdit,
@@ -409,12 +411,15 @@ export default function MatchList({
                 .select('winner,status,tournament_id')
                 .eq('tournament_id', tournamentId);
 
+            const rows: MinimalMatchRow[] = (all || []) as MinimalMatchRow[];
+
             const wins = new Map<string, number>();
-            (all || []).forEach((mm: any) => {
+            rows.forEach((mm) => {
                 if (mm.status === 'done' && mm.winner) {
                     wins.set(mm.winner, (wins.get(mm.winner) || 0) + 1);
                 }
             });
+
             const ordered = [...wins.entries()].sort((a, b) => b[1] - a[1]);
             gold = ordered[0]?.[0] ?? null;
             silver = ordered[1]?.[0] ?? null;
