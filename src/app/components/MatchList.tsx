@@ -570,15 +570,41 @@ export default function MatchList({
         const totalRounds = await getPoolTotalRounds(tournamentId);
 
         // Play-off déjà joué ?
+        // Play-off déjà joué ?
         const playoff = await fetchRound(tournamentId, 'winner', totalRounds + 1);
         if (playoff.length >= 1 && playoff[0].status === 'done') {
             const f = playoff[0];
             const gold = f.winner;
             const silver = f.winner === f.player1 ? f.player2 : f.player1;
+
+            // -> déterminer le 3e par nb de victoires parmi les non-finalistes
+            const { data: all } = await supabase
+                .from('matches')
+                .select('winner,status,bracket_type')
+                .eq('tournament_id', tournamentId)
+                .eq('bracket_type', 'winner');
+
+            const wins = new Map<string, number>();
+            (all || []).forEach((mm: any) => {
+                if (mm.status === 'done' && mm.winner) {
+                    wins.set(mm.winner, (wins.get(mm.winner) || 0) + 1);
+                }
+            });
+
+            const finalists = new Set([f.player1, f.player2].filter(Boolean) as string[]);
+            let bronze: string | null = null;
+            let best = -1;
+            for (const [pid, cnt] of wins) {
+                if (!finalists.has(pid) && cnt > best) {
+                    best = cnt;
+                    bronze = pid;
+                }
+            }
+
             setPodium({
                 gold: gold ?? null,
                 silver: silver ?? null,
-                bronze: null,
+                bronze: bronze ?? null,   // sera masqué si null par le test UI ci-dessus
                 fourth: null,
                 note: 'Résultat du match d’appui.',
             });
@@ -654,26 +680,10 @@ export default function MatchList({
                     }}
                 >
                     <div style={{ fontWeight: 700 }}>🏁 Tournoi terminé — Podium</div>
-                    {'gold' in (podium || {}) && (
-                        <div>
-                            🥇 1er : <b>{label(podium.gold ?? null)}</b>
-                        </div>
-                    )}
-                    {'silver' in (podium || {}) && (
-                        <div>
-                            🥈 2e : <b>{label(podium.silver ?? null)}</b>
-                        </div>
-                    )}
-                    {'bronze' in (podium || {}) && (
-                        <div>
-                            🥉 3e : <b>{label(podium.bronze ?? null)}</b>
-                        </div>
-                    )}
-                    {podium.fourth && (
-                        <div>
-                            4e : <b>{label(podium.fourth)}</b>
-                        </div>
-                    )}
+                    {podium?.gold != null && <div>🥇 1er : <b>{label(podium.gold)}</b></div>}
+                    {podium?.silver != null && <div>🥈 2e : <b>{label(podium.silver)}</b></div>}
+                    {podium?.bronze != null && <div>🥉 3e : <b>{label(podium.bronze)}</b></div>}
+                    {podium?.fourth != null && <div>4e : <b>{label(podium.fourth)}</b></div>}
                     {podium.note && <div style={{ opacity: 0.8, fontSize: 12 }}>{podium.note}</div>}
                 </div>
             )}
