@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState, useCallback } from 'react';
 import { supabase } from '@/lib/supabase';
+import { Button, Segment } from '@/app/components/ui';
 
 type P = {
     id: string;
@@ -570,41 +571,15 @@ export default function MatchList({
         const totalRounds = await getPoolTotalRounds(tournamentId);
 
         // Play-off déjà joué ?
-        // Play-off déjà joué ?
         const playoff = await fetchRound(tournamentId, 'winner', totalRounds + 1);
         if (playoff.length >= 1 && playoff[0].status === 'done') {
             const f = playoff[0];
             const gold = f.winner;
             const silver = f.winner === f.player1 ? f.player2 : f.player1;
-
-            // -> déterminer le 3e par nb de victoires parmi les non-finalistes
-            const { data: all } = await supabase
-                .from('matches')
-                .select('winner,status,bracket_type')
-                .eq('tournament_id', tournamentId)
-                .eq('bracket_type', 'winner');
-
-            const wins = new Map<string, number>();
-            (all || []).forEach((mm: any) => {
-                if (mm.status === 'done' && mm.winner) {
-                    wins.set(mm.winner, (wins.get(mm.winner) || 0) + 1);
-                }
-            });
-
-            const finalists = new Set([f.player1, f.player2].filter(Boolean) as string[]);
-            let bronze: string | null = null;
-            let best = -1;
-            for (const [pid, cnt] of wins) {
-                if (!finalists.has(pid) && cnt > best) {
-                    best = cnt;
-                    bronze = pid;
-                }
-            }
-
             setPodium({
                 gold: gold ?? null,
                 silver: silver ?? null,
-                bronze: bronze ?? null,   // sera masqué si null par le test UI ci-dessus
+                bronze: null,
                 fourth: null,
                 note: 'Résultat du match d’appui.',
             });
@@ -666,127 +641,70 @@ export default function MatchList({
     // ================= UI ====================
     // =========================================
     return (
-        <div style={{ display: 'grid', gap: 12 }}>
+        <div className="container stack">
+
             {/* Podium */}
             {podium && (
-                <div
-                    style={{
-                        background: '#0b1220',
-                        border: '1px solid #334155',
-                        padding: 12,
-                        borderRadius: 10,
-                        display: 'grid',
-                        gap: 6,
-                    }}
-                >
-                    <div style={{ fontWeight: 700 }}>🏁 Tournoi terminé — Podium</div>
+                <div className="podium fade-in stack">
+                    <div style={{ fontWeight: 800 }}>🏁 Tournoi terminé — Podium</div>
                     {podium?.gold != null && <div>🥇 1er : <b>{label(podium.gold)}</b></div>}
                     {podium?.silver != null && <div>🥈 2e : <b>{label(podium.silver)}</b></div>}
                     {podium?.bronze != null && <div>🥉 3e : <b>{label(podium.bronze)}</b></div>}
                     {podium?.fourth != null && <div>4e : <b>{label(podium.fourth)}</b></div>}
-                    {podium.note && <div style={{ opacity: 0.8, fontSize: 12 }}>{podium.note}</div>}
+                    {podium?.note && <div style={{ opacity: .85, fontSize: 13 }}>{podium.note}</div>}
                 </div>
             )}
 
-            {/* Bandeau top */}
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            {/* Top bar */}
+            <div className="hstack">
                 {tournamentCode && (
-                    <div
-                        style={{
-                            flex: 1,
-                            background: '#1f2937',
-                            color: 'white',
-                            padding: '8px 12px',
-                            textAlign: 'center',
-                            borderRadius: 8,
-                        }}
-                    >
-                        Code du tournoi : <b>{tournamentCode}</b>{' '}
-                        <button onClick={() => navigator.clipboard.writeText(tournamentCode)} style={{ marginLeft: 8 }}>
-                            Copier
-                        </button>
+                    <div className="card" style={{ flex: 1 }}>
+                        <div className="card__content hstack">
+                            <span>Code du tournoi : <b>{tournamentCode}</b></span>
+                            <span className="spacer" />
+                            <Button
+                                variant="ghost"
+                                onClick={() => navigator.clipboard.writeText(tournamentCode)}
+                            >
+                                Copier
+                            </Button>
+                        </div>
                     </div>
                 )}
                 {canEdit && (
-                    <button onClick={() => safeAction(finishTournament)} style={{ padding: '8px 12px', borderRadius: 8 }}>
+                    <Button variant="primary" onClick={() => safeAction(finishTournament)}>
                         Finir le tournoi
-                    </button>
+                    </Button>
                 )}
             </div>
 
-            {/* Toolbar validation */}
+            {/* Sticky toolbar when there are pending winners */}
             {canEdit && pendingCount > 0 && (
-                <div
-                    style={{
-                        display: 'flex',
-                        gap: 8,
-                        alignItems: 'center',
-                        background: '#0b1220',
-                        border: '1px solid #334155',
-                        padding: '8px 12px',
-                        borderRadius: 8,
-                    }}
-                >
-                    <span>{pendingCount} victoire(s) en attente</span>
-                    <button onClick={() => safeAction(confirmPending)} style={{ marginLeft: 'auto' }}>
-                        Confirmer
-                    </button>
-                    <button onClick={() => safeAction(clearPending)}>Annuler</button>
+                <div className="toolbar hstack">
+                    <span className="badge">✅ {pendingCount} victoire(s) en attente</span>
+                    <span className="spacer" />
+                    <Button variant="primary" onClick={() => safeAction(confirmPending)}>Confirmer</Button>
+                    <Button variant="ghost" onClick={() => safeAction(clearPending)}>Annuler</Button>
                 </div>
             )}
 
-            {/* Switch Winner / Loser */}
-            <div style={{ display: 'flex', gap: 8 }}>
-                <button
-                    onClick={() => setActiveBracket('winner')}
-                    style={{
-                        padding: '8px 12px',
-                        borderRadius: 8,
-                        border: '1px solid #ddd',
-                        background: activeBracket === 'winner' ? '#e5e7eb' : 'transparent',
-                    }}
-                >
-                    Winner Bracket
-                </button>
-                <button
-                    onClick={() => setActiveBracket('loser')}
-                    style={{
-                        padding: '8px 12px',
-                        borderRadius: 8,
-                        border: '1px solid #ddd',
-                        background: activeBracket === 'loser' ? '#e5e7eb' : 'transparent',
-                    }}
-                >
-                    Loser Bracket
-                </button>
-            </div>
+            {/* Winner / Loser segmented control */}
+            <Segment
+                value={activeBracket}
+                onChange={(v) => setActiveBracket(v as 'winner' | 'loser')}
+                items={[
+                    { label: 'Winner Bracket', value: 'winner' },
+                    { label: 'Loser Bracket', value: 'loser' },
+                ]}
+            />
 
-            {/* Grille par rounds */}
-            <div
-                style={{
-                    display: 'grid',
-                    gridAutoFlow: 'column',
-                    gridAutoColumns: 'minmax(260px, 1fr)',
-                    gap: 16,
-                    alignItems: 'start',
-                    overflowX: 'auto',
-                    paddingBottom: 8,
-                }}
-            >
-                {rounds.length === 0 && <div style={{ opacity: 0.7 }}>Aucun match dans ce bracket.</div>}
+            {/* Rounds grid */}
+            <div className="rounds">
+                {rounds.length === 0 && <div style={{ opacity: .7 }}>Aucun match dans ce bracket.</div>}
 
                 {rounds.map(([roundIdx, items]) => (
-                    <div key={roundIdx} style={{ display: 'grid', gap: 12 }}>
-                        <div
-                            style={{
-                                fontWeight: 700,
-                                textAlign: 'center',
-                                borderBottom: '1px solid #e5e7eb',
-                                paddingBottom: 4,
-                            }}
-                        >
-                            {roundTitle(roundIdx)}
-                        </div>
+                    <div key={roundIdx} className="stack">
+                        <div className="round-title">Round {roundIdx}</div>
 
                         {items.map((m) => {
                             const pendingWinner = pending[m.id];
@@ -794,84 +712,46 @@ export default function MatchList({
                             const isSelectedP2 = pendingWinner && pendingWinner === m.player2;
 
                             return (
-                                <div
-                                    key={m.id}
-                                    style={{
-                                        border: '1px solid #ddd',
-                                        borderRadius: 10,
-                                        padding: 10,
-                                        background: '#111827',
-                                        color: 'white',
-                                    }}
-                                >
-                                    <div style={{ fontWeight: 600, marginBottom: 8 }}>Match {m.slot}</div>
-
-                                    {/* joueurs */}
-                                    <div style={{ display: 'grid', gap: 6 }}>
-                                        <div
-                                            style={{
-                                                display: 'flex',
-                                                justifyContent: 'space-between',
-                                                background:
-                                                    m.status === 'done'
-                                                        ? m.winner === m.player1
-                                                            ? '#064e3b'
-                                                            : '#1f2937'
-                                                        : isSelectedP1
-                                                            ? '#065f46'
-                                                            : '#1f2937',
-                                                padding: '6px 8px',
-                                                borderRadius: 6,
-                                            }}
-                                        >
-                                            <span>{label(m.player1)}</span>
-                                            {canEdit && m.player1 && m.status !== 'done' && !tournamentFinished && (
-                                                <button onClick={() => safeAction(() => selectWinner(m, m.player1 as string))}>
-                                                    Gagnant
-                                                </button>
-                                            )}
+                                <div key={m.id} className="card">
+                                    <div className="card__content stack">
+                                        <div className="hstack">
+                                            <div style={{ fontWeight: 700 }}>Match {m.slot}</div>
+                                            <span className="spacer" />
+                                            {m.status === 'done' ? (
+                                                <span className="badge">Vainqueur : <b>{label(m.winner)}</b></span>
+                                            ) : pendingWinner ? (
+                                                <span style={{ opacity: .9 }}>Sélectionné : {label(pendingWinner)}</span>
+                                            ) : <span style={{ opacity: .6 }}>—</span>}
                                         </div>
 
-                                        <div
-                                            style={{
-                                                display: 'flex',
-                                                justifyContent: 'space-between',
-                                                background:
-                                                    m.status === 'done'
-                                                        ? m.winner === m.player2
-                                                            ? '#064e3b'
-                                                            : '#1f2937'
-                                                        : isSelectedP2
-                                                            ? '#065f46'
-                                                            : '#1f2937',
-                                                padding: '6px 8px',
-                                                borderRadius: 6,
-                                            }}
-                                        >
-                                            <span>{label(m.player2)}</span>
-                                            {canEdit && m.player2 && m.status !== 'done' && !tournamentFinished && (
-                                                <button onClick={() => safeAction(() => selectWinner(m, m.player2 as string))}>
-                                                    Gagnant
-                                                </button>
-                                            )}
-                                        </div>
-                                    </div>
-
-                                    {/* statut / actions */}
-                                    <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                                        {m.status === 'done' ? (
-                                            <div>
-                                                ✅ Vainqueur : <b>{label(m.winner)}</b>
+                                        {/* players */}
+                                        <div className="stack">
+                                            <div className={`matchline ${m.status === 'done' && m.winner === m.player1 ? 'is-winner' : ''} ${isSelectedP1 ? 'is-pending' : ''}`}>
+                                                <span>{label(m.player1)}</span>
+                                                {canEdit && m.player1 && m.status !== 'done' && !podium && (
+                                                    <Button size="sm" variant="ghost" onClick={() => safeAction(() => selectWinner(m, m.player1 as string))}>
+                                                        Gagnant
+                                                    </Button>
+                                                )}
                                             </div>
-                                        ) : pendingWinner ? (
-                                            <div style={{ opacity: 0.9 }}>Sélectionné : {label(pendingWinner)}</div>
-                                        ) : (
-                                            <div style={{ opacity: 0.7 }}>—</div>
-                                        )}
-                                        {canEdit && !tournamentFinished && (
-                                            <button style={{ marginLeft: 'auto' }} onClick={() => safeAction(() => reset(m))}>
-                                                Réinitialiser
-                                            </button>
+
+                                            <div className={`matchline ${m.status === 'done' && m.winner === m.player2 ? 'is-winner' : ''} ${isSelectedP2 ? 'is-pending' : ''}`}>
+                                                <span>{label(m.player2)}</span>
+                                                {canEdit && m.player2 && m.status !== 'done' && !podium && (
+                                                    <Button size="sm" variant="ghost" onClick={() => safeAction(() => selectWinner(m, m.player2 as string))}>
+                                                        Gagnant
+                                                    </Button>
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        {canEdit && !podium && (
+                                            <div className="hstack" style={{ marginTop: 8 }}>
+                                                <span className="spacer" />
+                                                <Button size="sm" variant="danger" onClick={() => safeAction(() => reset(m))}>
+                                                    Réinitialiser
+                                                </Button>
+                                            </div>
                                         )}
                                     </div>
                                 </div>
