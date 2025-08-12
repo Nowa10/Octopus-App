@@ -186,27 +186,32 @@ export default function MatchList({
     // Participants dans l’ordre du Round 1 (par slots croissants)
     async function getParticipantsOrdered(tId: string): Promise<string[]> {
         const { min } = await getAllRounds(tId, 'winner');
-        const r1 = await fetchRound(tId, 'winner', Math.max(1, min || 1));
+        const start = Math.max(1, min || 1);
+        const r1 = await fetchRound(tId, 'winner', start);
         r1.sort((a, b) => a.slot - b.slot);
+
         const seen = new Set<string>();
         const ordered: string[] = [];
         for (const m of r1) {
-            if (m.player1 && !seen.has(m.player1)) {
-                ordered.push(m.player1);
-                seen.add(m.player1);
-            }
-            if (m.player2 && !seen.has(m.player2)) {
-                ordered.push(m.player2);
-                seen.add(m.player2);
-            }
+            if (m.player1 && !seen.has(m.player1)) { ordered.push(m.player1); seen.add(m.player1); }
+            if (m.player2 && !seen.has(m.player2)) { ordered.push(m.player2); seen.add(m.player2); }
         }
         return ordered;
     }
 
     // > 6 => bracket ; ≤ 6 => poule
     async function isBracketMode(tId: string): Promise<boolean> {
+        // s'il y a des matches loser, c'est forcément un bracket
+        const { data: anyLosers } = await supabase
+            .from('matches')
+            .select('id')
+            .eq('tournament_id', tId)
+            .eq('bracket_type', 'loser')
+            .limit(1);
+        if (anyLosers && anyLosers.length > 0) return true;
+
         const parts = await getParticipantsOrdered(tId);
-        return parts.length > 6;
+        return parts.length >= 7; // 7+ => bracket ; 6- => poule
     }
 
     // ====== Helpers matches ======
@@ -377,18 +382,35 @@ export default function MatchList({
 
     // ====== POULE (round-robin) ======
 
+    function pairKey(a: string | null, b: string | null) {
+        if (!a || !b) return '';
+        return [a, b].sort().join('|');
+    }
+
+    async function getPrevByePlayer(tId: string, round: number): Promise<string | null> {
+        if (round <= 1) return null;
+        const prev = await fetchRound(tId, 'winner', round - 1);
+        for (const m of prev) {
+            if (m.player1 && !m.player2) return m.player1;
+            if (m.player2 && !m.player1) return m.player2;
+        }
+        return null;
+    }
+
+    // Remplace buildPoolSeed() par ceci
     async function buildPoolSeed(tId: string): Promise<(string | null)[]> {
         const { min } = await getAllRounds(tId, 'winner');
-        const r1 = await fetchRound(tId, 'winner', Math.max(1, min || 1));
+        const start = Math.max(1, min || 1);
+        const r1 = await fetchRound(tId, 'winner', start);
         r1.sort((a, b) => a.slot - b.slot);
 
-        const firsts = r1.map((m) => m.player1);
-        const seconds = r1.map((m) => m.player2).reverse();
-        const ids = [...firsts, ...seconds];
+        const firsts = r1.map(m => m.player1);
+        const seconds = r1.map(m => m.player2).reverse();
+        const ids = [...firsts, ...seconds].filter((x): x is (string | null) => true);
 
         const players = ids.filter((x): x is string => !!x);
-        if (players.length % 2 === 1) return [...players, null];
-        return players;
+        // nombre impair ⇒ un seul BYE
+        return players.length % 2 === 1 ? [...players, null] : players;
     }
 
     function rotateOnce(circle: (string | null)[]) {
@@ -422,16 +444,49 @@ export default function MatchList({
         const total = seed.length - 1;
 
         let circle = seed.slice();
+
         for (let round = 1; round <= total; round++) {
             if (round > 1) circle = rotateOnce(circle);
-            const pairs = pairsFromCircle(circle);
+
+            // On évite: (i) rematchs déjà planifiés ; (ii) même joueur qui reprend le BYE
+            const prevBye = await getPrevByePlayer(tId, round);
+            const allPrevPairs = new Set<string>();
+            for (let r = 1; r < round; r++) {
+                const ms = await fetchRound(tId, 'winner', r);
+                ms.forEach(m => allPrevPairs.add(pairKey(m.player1, m.player2)));
+            }
+
+            let chosen: Array<[string | null, string | null]> | null = null;
+            let attempt = 0;
+            const maxAttempts = circle.length * 2;
+
+            while (attempt < maxAttempts) {
+                const pairs = pairsFromCircle(circle);
+
+                const duplicate = pairs.some(([a, b]) => {
+                    const k = pairKey(a, b);
+                    return !!k && allPrevPairs.has(k);
+                });
+
+                let byeOk = true;
+                const byePair = pairs.find(([a, b]) => a === null || b === null);
+                if (byePair && prevBye) {
+                    const byePlayer = (byePair[0] || byePair[1]) as string;
+                    byeOk = byePlayer !== prevBye; // pas deux BYE d'affilée
+                }
+
+                if (!duplicate && byeOk) { chosen = pairs; break; }
+                circle = rotateOnce(circle);
+                attempt++;
+            }
+
+            const pairs = chosen ?? pairsFromCircle(circle); // fallback
 
             let slot = 1;
             for (const [a, b] of pairs) {
                 await setPlayersExact(tId, 'winner', round, slot, a, b);
-                if ((a && !b) || (!a && b)) {
-                    await setBYEAutoWin(tId, round, slot, (a || b) as string);
-                }
+                // BYE ⇒ autowin
+                if ((a && !b) || (!a && b)) await setBYEAutoWin(tId, round, slot, (a || b) as string);
                 slot++;
             }
         }
