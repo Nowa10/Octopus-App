@@ -21,7 +21,7 @@ export default function AppNav() {
                 <div className="topnav__inner">
                     <Link href="/" className="brand">
                         <span className="brand__dot" />
-                        <strong>JJB Club</strong>
+                        <strong>Octopus Team Tournament</strong>
                     </Link>
 
                     <nav className="topnav__links">

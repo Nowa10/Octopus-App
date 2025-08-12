@@ -3,7 +3,7 @@ import Link from 'next/link';
 export default function Home() {
   return (
     <>
-      <h1 className="section-title">Tournois JJB (Club)</h1>
+      <h1 className="section-title">Octopus Team Tournament</h1>
 
       <div className="stack">
         <Link href="/participants" className="link-card">Participants</Link>
