@@ -25,6 +25,11 @@ type M = {
 
 type MinimalMatchRow = Pick<M, 'winner' | 'status'>;
 
+type TournamentMeta = {
+    code: string;
+    format?: 'pool' | 'bracket' | null;
+};
+
 export default function MatchList({
     tournamentId,
     canEdit,
@@ -34,7 +39,7 @@ export default function MatchList({
 }) {
     const [matches, setMatches] = useState<M[]>([]);
     const [people, setPeople] = useState<Record<string, P>>({});
-    const [tournamentCode, setTournamentCode] = useState<string | null>(null);
+    const [tournament, setTournament] = useState<TournamentMeta | null>(null);
     const [activeBracket, setActiveBracket] = useState<'winner' | 'loser'>('winner');
 
     // Sélections en attente
@@ -85,11 +90,16 @@ export default function MatchList({
     useEffect(() => {
         supabase
             .from('tournaments')
-            .select('code')
+            .select('code, format')
             .eq('id', tournamentId)
             .single()
-            .then(({ data }) => setTournamentCode(data?.code || null));
+            .then(({ data }) =>
+                setTournament({ code: data?.code || '', format: (data?.format as any) ?? null })
+            );
     }, [tournamentId]);
+
+    const tournamentCode = tournament?.code || null;
+    const tournamentFormat = tournament?.format ?? null; // 'pool' | 'bracket' | null (null => pas de génération auto)
 
     const label = (id: string | null) =>
         id ? `${people[id]?.first_name || '?'} ${people[id]?.last_name || ''}` : 'BYE';
@@ -100,14 +110,13 @@ export default function MatchList({
         [matches, activeBracket]
     );
 
-    // Participants (synchro localement depuis le Round 1 du winner bracket)
+    // Participants (depuis le Round 1 du WB)
     const participantsFromState = useMemo(() => {
         const wb = matches.filter((m) => m.bracket_type === 'winner');
         if (wb.length === 0) return [] as string[];
         const minRound = Math.min(...wb.map((m) => m.round));
-        const r1 = wb
-            .filter((m) => m.round === minRound)
-            .sort((a, b) => a.slot - b.slot);
+        const r1 = wb.filter((m) => m.round === minRound).sort((a, b) => a.slot - b.slot);
+
         const seen = new Set<string>();
         const ordered: string[] = [];
         for (const m of r1) {
@@ -123,24 +132,11 @@ export default function MatchList({
         return ordered;
     }, [matches]);
 
-    const isBracketFromState = useMemo(
-        () => participantsFromState.length > 6,
-        [participantsFromState]
-    );
-
     const totalPoolRoundsFromState = useMemo(() => {
         const n = participantsFromState.length;
         const nWithBye = n % 2 === 0 ? n : n + 1;
         return Math.max(1, nWithBye - 1);
     }, [participantsFromState]);
-
-    const roundTitle = useCallback(
-        (roundIdx: number) => {
-            if (!isBracketFromState && roundIdx === totalPoolRoundsFromState + 1) return 'Finale poule';
-            return `Round ${roundIdx}`;
-        },
-        [isBracketFromState, totalPoolRoundsFromState]
-    );
 
     const rounds = useMemo(() => {
         const byRound = new Map<number, M[]>();
@@ -158,6 +154,7 @@ export default function MatchList({
     // ========== LOGIQUE TOURNOI ==============
     // =========================================
 
+    // --------- helpers communs ---------
     async function fetchRound(
         tId: string,
         bracket: 'winner' | 'loser',
@@ -183,7 +180,6 @@ export default function MatchList({
         return { min: arr.length ? Math.min(...arr) : 0, max: arr.length ? Math.max(...arr) : 0 };
     }
 
-    // Participants dans l’ordre du Round 1 (par slots croissants)
     async function getParticipantsOrdered(tId: string): Promise<string[]> {
         const { min } = await getAllRounds(tId, 'winner');
         const start = Math.max(1, min || 1);
@@ -193,25 +189,25 @@ export default function MatchList({
         const seen = new Set<string>();
         const ordered: string[] = [];
         for (const m of r1) {
-            if (m.player1 && !seen.has(m.player1)) { ordered.push(m.player1); seen.add(m.player1); }
-            if (m.player2 && !seen.has(m.player2)) { ordered.push(m.player2); seen.add(m.player2); }
+            if (m.player1 && !seen.has(m.player1)) {
+                ordered.push(m.player1);
+                seen.add(m.player1);
+            }
+            if (m.player2 && !seen.has(m.player2)) {
+                ordered.push(m.player2);
+                seen.add(m.player2);
+            }
         }
         return ordered;
     }
 
-    // > 6 => bracket ; ≤ 6 => poule
+    // Format résolu (ne JAMAIS générer la poule si le format est inconnu)
     async function isBracketMode(tId: string): Promise<boolean> {
-        // s'il y a des matches loser, c'est forcément un bracket
-        const { data: anyLosers } = await supabase
-            .from('matches')
-            .select('id')
-            .eq('tournament_id', tId)
-            .eq('bracket_type', 'loser')
-            .limit(1);
-        if (anyLosers && anyLosers.length > 0) return true;
-
-        const parts = await getParticipantsOrdered(tId);
-        return parts.length >= 7; // 7+ => bracket ; 6- => poule
+        if (tournamentFormat === 'bracket') return true;
+        if (tournamentFormat === 'pool') return false;
+        // format inconnu -> NE PAS générer la poule, on se contente d'afficher.
+        // On choisit "bracket" uniquement pour la logique de propagation (sans génération).
+        return true;
     }
 
     // ====== Helpers matches ======
@@ -278,6 +274,7 @@ export default function MatchList({
             .eq('id', m.id);
     }
 
+    // n’écrase jamais un joueur en place si les 2 slots sont déjà pris par d’autres
     async function setPlayerOnMatch(
         tId: string,
         bracket: 'winner' | 'loser',
@@ -287,47 +284,41 @@ export default function MatchList({
         prefer: 'player1' | 'player2' | 'auto' = 'auto'
     ) {
         const m = await ensureMatch(tId, bracket, round, slot);
+        const p1 = m.player1;
+        const p2 = m.player2;
+
+        // si déjà présent, ne rien faire
+        if (p1 === playerId || p2 === playerId) return;
+
         let update: Partial<M> | null = null;
-        if (prefer === 'player1') update = { player1: playerId };
-        else if (prefer === 'player2') update = { player2: playerId };
-        else update = !m.player1 ? { player1: playerId } : { player2: playerId };
-        await supabase.from('matches').update(update).eq('id', m.id);
+        if (prefer === 'player1') {
+            if (!p1) update = { player1: playerId };
+        } else if (prefer === 'player2') {
+            if (!p2) update = { player2: playerId };
+        } else {
+            // auto : place libre prioritaire
+            if (!p1) update = { player1: playerId };
+            else if (!p2) update = { player2: playerId };
+            else update = null;
+        }
+
+        if (update) await supabase.from('matches').update(update).eq('id', m.id);
     }
 
     // ====== BRACKET (élimination) ======
-    async function getFirstRoundInfo(tId: string) {
-        const { data } = await supabase
-            .from('matches')
-            .select('round')
-            .eq('tournament_id', tId)
-            .eq('bracket_type', 'winner');
-
-        if (!data || data.length === 0) return { firstRound: 1, firstCount: 0 };
-
-        const allRounds = data.map((x) => x.round);
-        const firstRound = Math.min(...allRounds);
-
-        const { data: r1 } = await supabase
-            .from('matches')
-            .select('id')
-            .eq('tournament_id', tId)
-            .eq('bracket_type', 'winner')
-            .eq('round', firstRound);
-
-        const firstCount = r1?.length ?? 0;
-        return { firstRound, firstCount };
-    }
-
     async function getPlannedWinnerFinalRound(tId: string): Promise<number> {
-        const { firstCount } = await getFirstRoundInfo(tId);
-        if (firstCount <= 1) return 1;
-        const playersApprox = Math.max(2, firstCount * 2);
-        return Math.ceil(Math.log2(playersApprox));
+        // Calcul fiable sur le nb de joueurs uniques du premier round
+        const ids = await getParticipantsOrdered(tId);
+        const nPlayers = Math.max(2, ids.length);
+        return Math.ceil(Math.log2(nPlayers));
     }
 
     async function ensureLoserSkeleton(tId: string) {
-        const plannedMax = await getPlannedWinnerFinalRound(tId);
-        if (plannedMax < 3) return;
+        // On ne fabrique un LB que pour 8 joueurs (QF/SF/Finale)
+        const ids = await getParticipantsOrdered(tId);
+        if (ids.length < 8) return;
+
+        // LB: R1(2 matches), R2(2 matches), R3(1 match) = bronze
         for (let slot = 1; slot <= 2; slot++) {
             await ensureMatch(tId, 'loser', 1, slot);
         }
@@ -343,39 +334,50 @@ export default function MatchList({
         await setPlayerOnMatch(m.tournament_id, 'winner', nextRound, nextSlot, winnerId, prefer);
     }
 
+    // QF losers -> LB R1 (slots 1..2) en paires (QF1/QF2) et (QF3/QF4)
     async function propagateLoserFromQFToLB1(m: M, loserId: string) {
+        const ids = await getParticipantsOrdered(m.tournament_id);
+        if (ids.length < 8) return; // mapping 8 joueurs uniquement
+
+        // Round des quarts = finalRound-2
         const plannedMax = await getPlannedWinnerFinalRound(m.tournament_id);
         const qfRound = plannedMax - 2;
         if (m.round !== qfRound) return;
 
         const qfs = await fetchRound(m.tournament_id, 'winner', qfRound);
         const qfIndex = qfs.findIndex((x) => x.id === m.id) + 1; // 1..4
-        const group = 2;
 
-        let lb1Slot = qfIndex;
-        let prefer: 'player1' | 'player2' = 'player1';
-        if (qfIndex > group) {
-            lb1Slot = qfIndex - group;
-            prefer = 'player2';
-        }
-        await setPlayerOnMatch(m.tournament_id, 'loser', 1, lb1Slot, loserId, prefer);
+        // QF1/QF2 -> LB1 slot1 ; QF3/QF4 -> LB1 slot2
+        const slotGroup = qfIndex <= 2 ? 1 : 2;
+        const prefer: 'player1' | 'player2' = qfIndex % 2 === 1 ? 'player1' : 'player2';
+        await setPlayerOnMatch(m.tournament_id, 'loser', 1, slotGroup, loserId, prefer);
     }
 
+    // SF losers -> LB R2 (cross)
     async function propagateLoserFromSFToLB2(m: M, loserId: string) {
+        const ids = await getParticipantsOrdered(m.tournament_id);
+        if (ids.length < 8) return;
+
         const plannedMax = await getPlannedWinnerFinalRound(m.tournament_id);
-        const sfRound = plannedMax - 1;
+        const sfRound = plannedMax - 1; // demi-finales
         if (m.round !== sfRound) return;
 
         const sfs = await fetchRound(m.tournament_id, 'winner', sfRound);
         const sfIndex = sfs.findIndex((x) => x.id === m.id) + 1; // 1 ou 2
+
+        // Cross: perdant SF1 -> LB R2 slot2 ; perdant SF2 -> LB R2 slot1
         const targetSlot = sfIndex === 1 ? 2 : 1;
-        await setPlayerOnMatch(m.tournament_id, 'loser', 2, targetSlot, loserId, 'auto');
+        await setPlayerOnMatch(m.tournament_id, 'loser', 2, targetSlot, loserId, 'player2');
     }
 
+    // LB winners -> LB suivant
     async function propagateWinnerLB(m: M, winnerId: string) {
-        if (m.round === 1) {
-            await setPlayerOnMatch(m.tournament_id, 'loser', 2, m.slot, winnerId, 'auto');
-        } else if (m.round === 2) {
+        // LB R1 -> LB R2 (slot identique)
+        if (m.bracket_type === 'loser' && m.round === 1) {
+            await setPlayerOnMatch(m.tournament_id, 'loser', 2, m.slot, winnerId, 'player1');
+        }
+        // LB R2 -> LB R3 (bronze) unique slot 1
+        else if (m.bracket_type === 'loser' && m.round === 2) {
             await setPlayerOnMatch(m.tournament_id, 'loser', 3, 1, winnerId, 'auto');
         }
     }
@@ -397,20 +399,19 @@ export default function MatchList({
         return null;
     }
 
-    // Remplace buildPoolSeed() par ceci
+    // seed robuste : dedup + un seul BYE si impair
     async function buildPoolSeed(tId: string): Promise<(string | null)[]> {
         const { min } = await getAllRounds(tId, 'winner');
         const start = Math.max(1, min || 1);
         const r1 = await fetchRound(tId, 'winner', start);
         r1.sort((a, b) => a.slot - b.slot);
 
-        const firsts = r1.map(m => m.player1);
-        const seconds = r1.map(m => m.player2).reverse();
-        const ids = [...firsts, ...seconds].filter((x): x is (string | null) => true);
+        const firsts = r1.map((m) => m.player1);
+        const seconds = r1.map((m) => m.player2).reverse();
+        const ids = [...firsts, ...seconds].filter((x): x is string => !!x);
 
-        const players = ids.filter((x): x is string => !!x);
-        // nombre impair ⇒ un seul BYE
-        return players.length % 2 === 1 ? [...players, null] : players;
+        const dedup = Array.from(new Set(ids));
+        return dedup.length % 2 === 1 ? [...dedup, null] : dedup;
     }
 
     function rotateOnce(circle: (string | null)[]) {
@@ -437,23 +438,28 @@ export default function MatchList({
         return Math.max(1, n - 1);
     }
 
-    // Génère TOUT le calendrier de poule en une fois (idempotent)
+    // Génère TOUT le calendrier de poule en une fois (idempotent, sans écraser)
     async function ensureFullPoolSchedule(tId: string) {
+        if (tournamentFormat !== 'pool') return; // sécurité
         const seed = await buildPoolSeed(tId);
         if (seed.length < 2) return;
         const total = seed.length - 1;
+
+        // si des rounds > 1 existent déjà, on ne régénère pas (évite écrasement)
+        const { max } = await getAllRounds(tId, 'winner');
+        if (max >= 2) return;
 
         let circle = seed.slice();
 
         for (let round = 1; round <= total; round++) {
             if (round > 1) circle = rotateOnce(circle);
 
-            // On évite: (i) rematchs déjà planifiés ; (ii) même joueur qui reprend le BYE
+            // On évite rematchs + BYE consécutif
             const prevBye = await getPrevByePlayer(tId, round);
             const allPrevPairs = new Set<string>();
             for (let r = 1; r < round; r++) {
                 const ms = await fetchRound(tId, 'winner', r);
-                ms.forEach(m => allPrevPairs.add(pairKey(m.player1, m.player2)));
+                ms.forEach((m) => allPrevPairs.add(pairKey(m.player1, m.player2)));
             }
 
             let chosen: Array<[string | null, string | null]> | null = null;
@@ -472,10 +478,13 @@ export default function MatchList({
                 const byePair = pairs.find(([a, b]) => a === null || b === null);
                 if (byePair && prevBye) {
                     const byePlayer = (byePair[0] || byePair[1]) as string;
-                    byeOk = byePlayer !== prevBye; // pas deux BYE d'affilée
+                    byeOk = byePlayer !== prevBye;
                 }
 
-                if (!duplicate && byeOk) { chosen = pairs; break; }
+                if (!duplicate && byeOk) {
+                    chosen = pairs;
+                    break;
+                }
                 circle = rotateOnce(circle);
                 attempt++;
             }
@@ -484,27 +493,82 @@ export default function MatchList({
 
             let slot = 1;
             for (const [a, b] of pairs) {
-                await setPlayersExact(tId, 'winner', round, slot, a, b);
-                // BYE ⇒ autowin
-                if ((a && !b) || (!a && b)) await setBYEAutoWin(tId, round, slot, (a || b) as string);
+                const mm = await ensureMatch(tId, 'winner', round, slot);
+                // n'écrit que si vide (idempotence)
+                if (!mm.player1 && !mm.player2 && mm.status !== 'done') {
+                    await setPlayersExact(tId, 'winner', round, slot, a, b);
+                    if ((a && !b) || (!a && b)) await setBYEAutoWin(tId, round, slot, (a || b) as string);
+                }
                 slot++;
             }
         }
     }
 
-    // Au premier chargement en mode poule, on génère le calendrier complet
-    useEffect(() => {
-        (async () => {
-            if (poolSetupDone) return;
-            const bracket = await isBracketMode(tournamentId);
-            if (!bracket) {
-                await ensureFullPoolSchedule(tournamentId);
-                await load();
+    // --- Helpers de reset sûrs (à mettre au même niveau que tes autres helpers) ---
+
+    // Efface un joueur donné de tous les matches >= fromRound d'un bracket donné (WB ou LB).
+    // On remet "winner" et "status" uniquement si on a vraiment touché player1/player2.
+    async function clearPlayerEverywhere(
+        tId: string,
+        bracket: 'winner' | 'loser',
+        fromRound: number,
+        playerId: string
+    ) {
+        const { data: ms } = await supabase
+            .from('matches')
+            .select('*')
+            .eq('tournament_id', tId)
+            .eq('bracket_type', bracket)
+            .gte('round', fromRound);
+
+        for (const mm of ms || []) {
+            const patch: Partial<M> = {};
+            let touched = false;
+
+            if (mm.player1 === playerId) {
+                patch.player1 = null;
+                touched = true;
             }
-            setPoolSetupDone(true);
-        })();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [tournamentId, poolSetupDone]);
+            if (mm.player2 === playerId) {
+                patch.player2 = null;
+                touched = true;
+            }
+
+            if (touched) {
+                patch.winner = null;
+                patch.status = 'pending';
+                await supabase.from('matches').update(patch).eq('id', mm.id);
+            }
+        }
+    }
+
+    // --- RESET récursif SANS tableau de Promises (corrige l'erreur TS) ---
+    // Nettoie le match courant + toutes les propagations en aval (WB et LB).
+    async function resetRecursive(m: M) {
+        const tId = m.tournament_id;
+
+        // On mémorise les infos AVANT reset (pour savoir qui a pu être propagé)
+        const prevWinner = m.winner;
+        const p1 = m.player1;
+        const p2 = m.player2;
+
+        // 1) Reset du match courant
+        await supabase
+            .from('matches')
+            .update({ winner: null, status: 'pending' })
+            .eq('id', m.id);
+
+        // 2) WB : si un vainqueur avait été propagé, on l'efface de tous les matches WB suivants
+        if (m.bracket_type === 'winner' && prevWinner) {
+            await clearPlayerEverywhere(tId, 'winner', m.round + 1, prevWinner);
+        }
+
+        // 3) LB : si un perdant avait été propagé, on l’efface de tout le loser bracket
+        //    Dans le doute (match en "pending", BYE auto-win, etc.), on nettoie p1 ET p2.
+        if (p1) await clearPlayerEverywhere(tId, 'loser', 1, p1);
+        if (p2) await clearPlayerEverywhere(tId, 'loser', 1, p2);
+    }
+
 
     // ---------- Application d’un vainqueur ----------
     async function applyWinner(m: M, winnerId: string) {
@@ -512,8 +576,8 @@ export default function MatchList({
 
         await supabase.from('matches').update({ winner: winnerId, status: 'done' }).eq('id', m.id);
 
-        const bracket = await isBracketMode(m.tournament_id);
-        if (bracket) {
+        const isBracket = await isBracketMode(m.tournament_id);
+        if (isBracket) {
             await ensureLoserSkeleton(m.tournament_id);
 
             if (m.bracket_type === 'winner') {
@@ -521,15 +585,19 @@ export default function MatchList({
                 const isFinal = m.round === plannedMax;
                 if (!isFinal) await propagateWinnerWB(m, winnerId);
                 if (loserId) {
-                    const qfRound = plannedMax - 2;
-                    const sfRound = plannedMax - 1;
-                    if (m.round === qfRound) await propagateLoserFromQFToLB1(m, loserId);
-                    else if (m.round === sfRound) await propagateLoserFromSFToLB2(m, loserId);
+                    const ids = await getParticipantsOrdered(m.tournament_id);
+                    if (ids.length >= 8) {
+                        const qfRound = plannedMax - 2;
+                        const sfRound = plannedMax - 1;
+                        if (m.round === qfRound) await propagateLoserFromQFToLB1(m, loserId);
+                        else if (m.round === sfRound) await propagateLoserFromSFToLB2(m, loserId);
+                    }
                 }
             } else {
                 await propagateWinnerLB(m, winnerId);
             }
 
+            // incrément du Hall of Fame si finale WB jouée
             const plannedMax2 = await getPlannedWinnerFinalRound(m.tournament_id);
             const isFinal2 = m.bracket_type === 'winner' && m.round === plannedMax2;
             if (isFinal2) {
@@ -577,7 +645,7 @@ export default function MatchList({
     }
 
     const reset = async (m: M) => {
-        await supabase.from('matches').update({ winner: null, status: 'pending' }).eq('id', m.id);
+        await resetRecursive(m);
         await load();
     };
 
@@ -625,7 +693,7 @@ export default function MatchList({
         // ===== Poule : classement par victoires (+ éventuel match d’appui)
         const totalRounds = await getPoolTotalRounds(tournamentId);
 
-        // Play-off déjà joué ?
+        // Playoff déjà joué ?
         const playoff = await fetchRound(tournamentId, 'winner', totalRounds + 1);
         if (playoff.length >= 1 && playoff[0].status === 'done') {
             const f = playoff[0];
@@ -641,7 +709,7 @@ export default function MatchList({
             return;
         }
 
-        // Classement par victoires (winner uniquement)
+        // Classement par victoires
         const { data: all } = await supabase
             .from('matches')
             .select('winner,status')
@@ -686,17 +754,39 @@ export default function MatchList({
         await computePodium();
     }
 
-    // ==== Fin réellement actée ? (empêche les clics seulement quand médailles fixées)
     const tournamentFinished = useMemo(() => {
         if (!podium) return false;
         return Boolean(podium.gold || podium.silver || podium.bronze || podium.fourth);
     }, [podium]);
+
+    // ---------- Génération poule au 1er chargement si (et seulement si) format === 'pool' ----------
+    useEffect(() => {
+        (async () => {
+            if (poolSetupDone) return;
+            if (tournamentFormat === 'pool') {
+                await ensureFullPoolSchedule(tournamentId);
+                await load();
+            }
+            setPoolSetupDone(true);
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [tournamentId, poolSetupDone, tournamentFormat]);
 
     // =========================================
     // ================= UI ====================
     // =========================================
     return (
         <div className="container stack">
+
+            {/* Alerte format manquant */}
+            {tournamentFormat == null && (
+                <div className="card">
+                    <div className="card__content" style={{ color: '#8a1c1c' }}>
+                        ⚠️ Format du tournoi non défini dans <code>tournaments.format</code> (attendu: <b>pool</b> ou <b>bracket</b>).
+                        La génération automatique de calendrier est désactivée pour éviter toute erreur.
+                    </div>
+                </div>
+            )}
 
             {/* Podium */}
             {podium && (
