@@ -573,11 +573,13 @@ export default function MatchList({
             // créer match d’appui si absent
             if (playoff.length === 0) {
                 await setPlayersExact(tournamentId, 'winner', totalRounds + 1, 1, first[0], second[0]);
+                await load(); // <-- rafraîchir pour afficher le nouveau round/match
             }
             setPodium({
                 note:
                     'Égalité pour la 1ère place : un match d’appui a été créé. Jouez-le puis cliquez à nouveau sur "Finir le tournoi".',
             });
+            return; // optionnel: on sort ici
         } else {
             setPodium({
                 gold: first?.[0] ?? null,
