@@ -357,21 +357,31 @@ export default function MatchList({
     }
 
     function pairKey(a: string | null, b: string | null) {
-        if (!a || !b) return ''; // BYE -> pas de clé
+        if (!a || !b) return '';             // pas de clé pour un BYE
         return [a, b].sort().join('|');
     }
 
-    async function playedPairsAtRound(tId: string, round: number) {
-        if (round < 1) return new Set<string>();
-        const prev = await fetchRound(tId, 'winner', round);
+    async function getStartRound(tId: string) {
+        const { min } = await getAllRounds(tId, 'winner');
+        return Math.max(1, min || 1);
+    }
+
+    // Toutes les paires déjà jouées jusqu’à `uptoRound` inclus
+    async function playedPairsUntil(tId: string, uptoRound: number) {
+        const start = await getStartRound(tId);
         const keys = new Set<string>();
-        prev.forEach((m) => keys.add(pairKey(m.player1, m.player2)));
+        for (let r = start; r <= Math.max(start, uptoRound); r++) {
+            const ms = await fetchRound(tId, 'winner', r);
+            ms.forEach(m => keys.add(pairKey(m.player1, m.player2)));
+        }
         return keys;
     }
 
+    // Compte des BYE pour chaque joueur jusqu’au round-1
     async function countByesUpToRound(tId: string, uptoRound: number) {
+        const start = await getStartRound(tId);
         const counts = new Map<string, number>();
-        for (let r = 1; r < uptoRound; r++) {
+        for (let r = start; r < uptoRound; r++) {
             const ms = await fetchRound(tId, 'winner', r);
             for (const m of ms) {
                 if (m.player1 && !m.player2) counts.set(m.player1, (counts.get(m.player1) || 0) + 1);
@@ -389,28 +399,40 @@ export default function MatchList({
 
     // Crée/écrit le round N (évite rematch immédiat + équilibre BYE)
     async function ensurePoolRound(tId: string, round: number) {
-        const seed = await buildPoolSeed(tId);
+        const seed = await buildPoolSeed(tId);           // joueurs + éventuellement null
         const total = Math.max(1, seed.length - 1);
         if (round < 1 || round > total) return;
 
-        let circle = seed.slice();
-        for (let r = 2; r <= round; r++) circle = rotateOnce(circle);
-
-        const prevPairs = await playedPairsAtRound(tId, round - 1);
+        const expectedBye = seed.includes(null) ? 1 : 0;
+        const allPrevPairs = await playedPairsUntil(tId, round - 1);
         const byeCounts = await countByesUpToRound(tId, round);
-        const allPlayers = seed.filter(Boolean) as string[];
-        const minBye = allPlayers.reduce((m, p) => Math.min(m, byeCounts.get(p) || 0), Infinity);
+        const players = seed.filter(Boolean) as string[];
+        const minBye = players.reduce((m, p) => Math.min(m, byeCounts.get(p) || 0), Infinity);
+        const minByeSet = new Set(players.filter(p => (byeCounts.get(p) || 0) === minBye));
 
-        let tries = 0;
-        while (tries < circle.length) {
+        let circle = seed.slice();
+        // on essaye plusieurs rotations jusqu’à satisfaire les contraintes
+        for (let tries = 0; tries < circle.length * 2; tries++) {
             const pairs = pairsFromCircle(circle);
-            const hasImmediateRematch = pairs.some(([a, b]) => prevPairs.has(pairKey(a, b)));
-            const byePair = pairs.find(([a, b]) => a === null || b === null);
-            const byePlayer = byePair ? (byePair[0] || byePair[1]) : null;
-            const byeOverUsed = byePlayer ? ((byeCounts.get(byePlayer) || 0) > minBye) : false;
 
-            if (!hasImmediateRematch && !byeOverUsed) {
-                // écrire
+            // 1) aucune paire déjà jouée
+            const duplicate = pairs.some(([a, b]) => {
+                const k = pairKey(a, b);
+                return k && allPrevPairs.has(k);
+            });
+
+            // 2) BYE donné uniquement à un joueur au minimum actuel
+            let byeOk = expectedBye === 0;
+            const byePair = pairs.find(([a, b]) => a === null || b === null);
+            if (expectedBye === 1) {
+                if (!byePair) byeOk = false;
+                else {
+                    const byePlayer = (byePair[0] || byePair[1]) as string;
+                    byeOk = minByeSet.has(byePlayer);
+                }
+            }
+
+            if (!duplicate && byeOk) {
                 let slot = 1;
                 for (const [a, b] of pairs) {
                     await setPlayersExact(tId, 'winner', round, slot, a, b);
@@ -419,10 +441,9 @@ export default function MatchList({
                 return;
             }
             circle = rotateOnce(circle);
-            tries++;
         }
 
-        // fallback (ne devrait pas arriver)
+        // Fallback (ne devrait pas se produire)
         let slot = 1;
         for (const [a, b] of pairsFromCircle(circle)) {
             await setPlayersExact(tId, 'winner', round, slot, a, b);
