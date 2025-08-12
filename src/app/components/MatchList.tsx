@@ -135,39 +135,53 @@ export default function MatchList({
     const bracketMatches = useMemo(() => {
         if (activeBracket !== 'winner') return bracketMatchesRaw;
 
+        // 👇 UI-only (ne pas utiliser ailleurs)
+        const uiMode: 'pool' | 'bracket' | 'hybrid_multi' =
+            tournamentFormat === 'pool'
+                ? 'pool'
+                : poolTabs.enabled
+                    ? 'hybrid_multi'
+                    : 'bracket';
+
+        // --- Cas multi-poules avec onglets ---
         if (poolTabs.enabled && activePoolTab) {
+            const ps = poolTabs.playoffsStart ?? Number.POSITIVE_INFINITY;
+
             if (activePoolTab === 'Playoffs') {
-                if (poolTabs.playoffsStart != null) {
-                    return bracketMatchesRaw.filter((m) => m.round >= (poolTabs.playoffsStart as number));
-                }
-                return [];
+                // Playoffs : on affiche tout (les BYE éventuels sont permis en bracket)
+                return bracketMatchesRaw.filter(m => m.round >= ps);
             }
 
-            // Pool A/B/C…
+            // Onglets A/B/C… : matches de la phase poules uniquement, et on cache BYE
             const idx = poolTabs.labels.indexOf(activePoolTab);
             if (idx >= 0) {
                 const roster = new Set(poolTabs.idsByPool[idx] || []);
-                const playoffsStart = poolTabs.playoffsStart ?? Number.POSITIVE_INFINITY;
-
-                // 🔑 Ne garder que:
-                // - les matches AVANT les playoffs
-                // - ET dont les joueurs appartiennent à la même poule (BYE autorisé si l’autre joueur est dans la poule)
-                return bracketMatchesRaw.filter((m) => {
-                    if (m.round >= playoffsStart) return false;
-                    const a = m.player1, b = m.player2;
-                    const aIn = a ? roster.has(a) : false;
-                    const bIn = b ? roster.has(b) : false;
-                    // cas BYE: un seul joueur présent dans la poule
-                    const isBye = (a && !b) || (!a && b);
-                    if (isBye) return aIn || bIn;
-                    // sinon les deux doivent appartenir à la poule
-                    return aIn && bIn;
+                return bracketMatchesRaw.filter(m => {
+                    if (m.round >= ps) return false;            // pas les playoffs ici
+                    if (!m.player1 || !m.player2) return false; // cache BYE en poule
+                    return roster.has(m.player1) && roster.has(m.player2);
                 });
             }
         }
 
+        // --- Cas poule unique ---
+        if (uiMode === 'pool') {
+            // Cache BYE en poule simple
+            return bracketMatchesRaw.filter(m => m.player1 && m.player2);
+        }
+
+        // --- Bracket pur : on montre tout ---
         return bracketMatchesRaw;
-    }, [bracketMatchesRaw, poolTabs, activePoolTab, activeBracket]);
+    }, [
+        bracketMatchesRaw,
+        poolTabs.enabled,
+        poolTabs.playoffsStart,
+        poolTabs.labels,
+        poolTabs.idsByPool,
+        activePoolTab,
+        activeBracket,
+        tournamentFormat,
+    ]);
 
     const rounds = useMemo(() => {
         const byRound = new Map<number, M[]>();
@@ -262,7 +276,7 @@ export default function MatchList({
     }
 
     async function decideMode(tId: string): Promise<'pool' | 'bracket' | 'hybrid_multi'> {
-        // Respecte le format s’il est fixé
+        // Respecter un format forcé
         if (tournamentFormat === 'pool') return 'pool';
         if (tournamentFormat === 'bracket') {
             const ids = await getParticipantsOrdered(tId);
@@ -271,6 +285,7 @@ export default function MatchList({
             if (isPowerOfTwo(n) && n >= 8) return 'bracket';
             return 'hybrid_multi';
         }
+
         // Auto
         const ids = await getParticipantsOrdered(tId);
         const n = ids.length;
@@ -527,10 +542,11 @@ export default function MatchList({
 
             let slot = 1;
             for (const [a, b] of pairs) {
+                if (!a || !b) continue; // 👈 skip BYE en poule
+
                 const mm = await ensureMatch(tId, 'winner', round, slot);
                 if (!mm.player1 && !mm.player2 && mm.status !== 'done') {
                     await setPlayersExact(tId, 'winner', round, slot, a, b);
-                    if ((a && !b) || (!a && b)) await setBYEAutoWin(tId, round, slot, (a || b) as string);
                 }
                 slot++;
             }
@@ -589,13 +605,15 @@ export default function MatchList({
                 const round = startRound + g * K + p; // intercalage
                 let slot = 1;
                 for (const [a, b] of pairs) {
+                    if (!a || !b) continue; // 👈 skip BYE en poule
+
                     const mm = await ensureMatch(tId, 'winner', round, slot);
                     if (!mm.player1 && !mm.player2 && mm.status !== 'done') {
                         await setPlayersExact(tId, 'winner', round, slot, a, b);
-                        if ((a && !b) || (!a && b)) await setBYEAutoWin(tId, round, slot, (a || b) as string);
                     }
                     slot++;
                 }
+
             }
         }
     }
