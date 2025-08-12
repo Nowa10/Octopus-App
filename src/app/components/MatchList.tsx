@@ -50,7 +50,15 @@ export default function MatchList({
         roundsByPool: number[][];
         playoffsStart: number | null;
         labels: string[];
-    }>({ enabled: false, K: 0, roundsByPool: [], playoffsStart: null, labels: [] });
+        idsByPool: string[][];
+    }>({
+        enabled: false,
+        K: 0,
+        roundsByPool: [],
+        playoffsStart: null,
+        labels: [],
+        idsByPool: [],           // 👈 NEW
+    });
     const [activePoolTab, setActivePoolTab] = useState<string | null>(null); // 'A','B','C','Playoffs'|null
 
     // Sélections en attente (matchId -> winnerId)
@@ -134,13 +142,30 @@ export default function MatchList({
                 }
                 return [];
             }
+
             // Pool A/B/C…
             const idx = poolTabs.labels.indexOf(activePoolTab);
             if (idx >= 0) {
-                const setRounds = new Set(poolTabs.roundsByPool[idx] || []);
-                return bracketMatchesRaw.filter((m) => setRounds.has(m.round));
+                const roster = new Set(poolTabs.idsByPool[idx] || []);
+                const playoffsStart = poolTabs.playoffsStart ?? Number.POSITIVE_INFINITY;
+
+                // 🔑 Ne garder que:
+                // - les matches AVANT les playoffs
+                // - ET dont les joueurs appartiennent à la même poule (BYE autorisé si l’autre joueur est dans la poule)
+                return bracketMatchesRaw.filter((m) => {
+                    if (m.round >= playoffsStart) return false;
+                    const a = m.player1, b = m.player2;
+                    const aIn = a ? roster.has(a) : false;
+                    const bIn = b ? roster.has(b) : false;
+                    // cas BYE: un seul joueur présent dans la poule
+                    const isBye = (a && !b) || (!a && b);
+                    if (isBye) return aIn || bIn;
+                    // sinon les deux doivent appartenir à la poule
+                    return aIn && bIn;
+                });
             }
         }
+
         return bracketMatchesRaw;
     }, [bracketMatchesRaw, poolTabs, activePoolTab, activeBracket]);
 
@@ -193,16 +218,13 @@ export default function MatchList({
             .select('player1,player2')
             .eq('tournament_id', tId);
 
-        type PlayerPair = Pick<M, 'player1' | 'player2'>;
-        const rows: PlayerPair[] = (data || []) as PlayerPair[];
-
+        type Row = { player1: string | null; player2: string | null };
         const ids = new Set<string>();
-        rows.forEach((m) => {
+        (data as Row[] | null)?.forEach((m) => {
             if (m.player1) ids.add(m.player1);
             if (m.player2) ids.add(m.player2);
         });
         return [...ids];
-
     }
 
     // Ancienne méthode (R1) — on la garde en fallback
@@ -597,9 +619,18 @@ export default function MatchList({
 
     // Détection des blocs de poules + début playoffs — appelée après CHAQUE load()
     const recomputePoolTabs = useCallback(async () => {
+
+        // 👉 NEW: ne pas afficher d’onglets si on n’est pas en mode multi‑poules
+        const mode = await decideMode(tournamentId);
+        if (mode !== 'hybrid_multi') {
+            setPoolTabs({ enabled: false, K: 0, roundsByPool: [], playoffsStart: null, labels: [], idsByPool: [] });
+            setActivePoolTab(null);
+            return;
+        }
+
         const { max } = await getAllRounds(tournamentId, 'winner');
         if (!max) {
-            setPoolTabs({ enabled: false, K: 0, roundsByPool: [], playoffsStart: null, labels: [] });
+            setPoolTabs({ enabled: false, K: 0, roundsByPool: [], playoffsStart: null, labels: [], idsByPool: [] });
             setActivePoolTab(null);
             return;
         }
@@ -610,7 +641,7 @@ export default function MatchList({
             if (ms.length > 0) roundsNonVides.push(r);
         }
         if (roundsNonVides.length === 0) {
-            setPoolTabs({ enabled: false, K: 0, roundsByPool: [], playoffsStart: null, labels: [] });
+            setPoolTabs({ enabled: false, K: 0, roundsByPool: [], playoffsStart: null, labels: [], idsByPool: [] });
             setActivePoolTab(null);
             return;
         }
@@ -629,7 +660,7 @@ export default function MatchList({
         }
 
         if (bestK === 0) {
-            setPoolTabs({ enabled: false, K: 0, roundsByPool: [], playoffsStart: null, labels: [] });
+            setPoolTabs({ enabled: false, K: 0, roundsByPool: [], playoffsStart: null, labels: [], idsByPool: [] });
             setActivePoolTab(null);
             return;
         }
@@ -643,7 +674,17 @@ export default function MatchList({
 
         const labels = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.slice(0, bestK).split('');
 
-        setPoolTabs({ enabled: true, K: bestK, roundsByPool, playoffsStart, labels });
+        const allIds = await getParticipantsOrdered(tournamentId);
+        const idsByPool = splitIntoKPoolsMax5(allIds).slice(0, bestK); // garde-fou si <= 4
+
+        setPoolTabs({
+            enabled: true,
+            K: bestK,
+            roundsByPool,
+            playoffsStart,
+            labels,
+            idsByPool, // 👈 NEW
+        });
         // Si onglet non défini, on ouvre Poule A
         setActivePoolTab((prev) => prev ?? labels[0] ?? 'Playoffs');
     }, [tournamentId]);
