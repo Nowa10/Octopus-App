@@ -34,11 +34,14 @@ export default function MatchList({
     const [tournamentCode, setTournamentCode] = useState<string | null>(null);
     const [activeBracket, setActiveBracket] = useState<'winner' | 'loser'>('winner');
 
-    // Anti-spam bouton
+    // Sélections en attente de validation: matchId -> winnerId
+    const [pending, setPending] = useState<Record<string, string>>({});
+
+    // Anti-spam
     const [lastClick, setLastClick] = useState(0);
     function safeAction(fn: () => void) {
         const now = Date.now();
-        if (now - lastClick < 1000) return;
+        if (now - lastClick < 400) return;
         setLastClick(now);
         fn();
     }
@@ -116,15 +119,37 @@ export default function MatchList({
         return data || [];
     }
 
-    // max round dans le winner bracket (sert à déduire R16/QF/SF/F)
-    async function getMaxWinnerRound(tId: string): Promise<number> {
+    // round de départ (souvent 1) et nb de matchs de ce round
+    async function getFirstRoundInfo(tId: string) {
         const { data } = await supabase
             .from('matches')
             .select('round')
             .eq('tournament_id', tId)
             .eq('bracket_type', 'winner');
-        if (!data || data.length === 0) return 1;
-        return Math.max(...data.map((x) => x.round));
+
+        if (!data || data.length === 0) return { firstRound: 1, firstCount: 0 };
+
+        const allRounds = data.map((x) => x.round);
+        const firstRound = Math.min(...allRounds);
+
+        const { data: r1 } = await supabase
+            .from('matches')
+            .select('id')
+            .eq('tournament_id', tId)
+            .eq('bracket_type', 'winner')
+            .eq('round', firstRound);
+
+        const firstCount = r1?.length ?? 0;
+        return { firstRound, firstCount };
+    }
+
+    // max round "théorique" du WB (en fonction du nombre de matchs du 1er round)
+    async function getPlannedWinnerFinalRound(tId: string): Promise<number> {
+        const { firstCount } = await getFirstRoundInfo(tId);
+        if (firstCount <= 1) return 1;
+        const B = Math.max(2, firstCount * 2); // joueurs ~ 2 par match du 1er round
+        const maxR = Math.ceil(Math.log2(B));
+        return maxR; // ex: 8 joueurs => 3 (QF=1, SF=2, F=3)
     }
 
     // récupère (ou crée) un match précis
@@ -188,18 +213,22 @@ export default function MatchList({
         await supabase.from('matches').update(update).eq('id', m.id);
     }
 
-    // Construit le squelette du loser bracket (LB1: perdants QF, LB2: + perdants SF, LB3: bronze)
+    // Construit le squelette du loser bracket (LB1, LB2, LB3)
     async function ensureLoserSkeleton(tId: string) {
-        const maxWB = await getMaxWinnerRound(tId);
-        // s'il n'y a pas de QF/SF, pas de bronze (catégories <7 gérées ailleurs)
-        if (maxWB < 3) return;
+        const maxWB = await getPlannedWinnerFinalRound(tId);
+        if (maxWB < 3) return; // pas de QF/SF => pas de bronze
 
-        const qfRound = maxWB - 2;
-        const sfs = await fetchRound(tId, 'winner', maxWB - 1);
-        const qfs = await fetchRound(tId, 'winner', qfRound);
+        // On déduit le nb de QF à partir du 1er round
+        const { firstRound, firstCount } = await getFirstRoundInfo(tId);
+        // Si le 1er round est déjà des QF (cas N=8), firstCount = 4
+        // Si ce n'est pas le cas (N=16, R16 d'abord), quand on arrivera au QF on aura round=2
 
-        const qfCount = qfs.length;      // 4 (pour 8/16), 8 (pour 32), ...
-        const lb1Matches = Math.max(1, qfCount / 2);
+        const qfCount = 4; // structure LB dépend des QF => on sait qu'il y en a 4 pour un bracket à 8
+        // Pour des brackets supérieurs (16-> QF = 8), on calcule proprement:
+        const derivedQFCount = Math.max(2, Math.pow(2, Math.max(0, maxWB - 3))); // 8->4, 16->8, 32->16
+        const realQFCount = derivedQFCount;
+
+        const lb1Matches = Math.max(1, realQFCount / 2);
 
         // LB1 : slots 1..lb1Matches
         for (let slot = 1; slot <= lb1Matches; slot++) {
@@ -210,8 +239,6 @@ export default function MatchList({
         await ensureMatch(tId, 'loser', 2, 2);
         // LB3 : petite finale
         await ensureMatch(tId, 'loser', 3, 1);
-
-        // (aucun placement ici — uniquement la structure)
     }
 
     // ---------- Propagations déterministes ----------
@@ -227,7 +254,7 @@ export default function MatchList({
     // QF -> LB1 : croisement anti re-match
     async function propagateLoserFromQFToLB1(m: M, loserId: string) {
         const tId = m.tournament_id;
-        const maxWB = await getMaxWinnerRound(tId);
+        const maxWB = await getPlannedWinnerFinalRound(tId);
         const qfRound = maxWB - 2;
         if (m.round !== qfRound) return;
 
@@ -249,7 +276,7 @@ export default function MatchList({
     // SF -> LB2 : injection opposée (perdant DF1 va en LB2 slot 2, perdant DF2 va en LB2 slot 1)
     async function propagateLoserFromSFToLB2(m: M, loserId: string) {
         const tId = m.tournament_id;
-        const maxWB = await getMaxWinnerRound(tId);
+        const maxWB = await getPlannedWinnerFinalRound(tId);
         const sfRound = maxWB - 1;
         if (m.round !== sfRound) return;
 
@@ -269,36 +296,35 @@ export default function MatchList({
             // G(LB2) -> LB3 (petite finale) slot 1
             await setPlayerOnMatch(m.tournament_id, 'loser', 3, 1, winnerId, 'auto');
         } else {
-            // LB3 gagné = 3e place (rien à propager)
+            // LB3 gagné = 3e place
         }
     }
 
-    // ---------- Action principale : définir le vainqueur ----------
-    const setWinner = async (m: M, winnerId: string | null) => {
-        if (!winnerId) return;
-
+    // ---------- Application d’un vainqueur (écriture DB + propagation) ----------
+    async function applyWinner(m: M, winnerId: string) {
         const loserId = m.player1 === winnerId ? m.player2 : m.player1;
 
-        // 1) Marquer le match
+        // 1) marquer le match
         await supabase.from('matches').update({ winner: winnerId, status: 'done' }).eq('id', m.id);
 
-        // 2) S'assurer que le squelette du loser bracket existe (idempotent)
+        // 2) squelette LB (idempotent)
         await ensureLoserSkeleton(m.tournament_id);
 
         // 3) Propagations
         if (m.bracket_type === 'winner') {
-            const maxWB = await getMaxWinnerRound(m.tournament_id);
+            // Propager le vainqueur WB -> round suivant tant qu’on n’est pas en finale.
+            const plannedMax = await getPlannedWinnerFinalRound(m.tournament_id);
+            // on considère "finale" si ce round contient 1 seul match
+            const thisRound = await fetchRound(m.tournament_id, 'winner', m.round);
+            const isFinal = thisRound.length === 1 || m.round >= plannedMax;
 
-            // vainqueur -> WB (round+1) si pas finale
-            if (m.round < maxWB) {
+            if (!isFinal) {
                 await propagateWinnerWB(m, winnerId);
             }
 
-            // perdant -> LB (QF -> LB1, SF -> LB2). Avant QF : éliminé.
             if (loserId) {
-                const qfRound = maxWB - 2;
-                const sfRound = maxWB - 1;
-
+                const qfRound = plannedMax - 2;
+                const sfRound = plannedMax - 1;
                 if (m.round === qfRound) {
                     await propagateLoserFromQFToLB1(m, loserId);
                 } else if (m.round === sfRound) {
@@ -306,14 +332,15 @@ export default function MatchList({
                 }
             }
         } else {
-            // loser bracket : vainqueur avance selon mapping
             await propagateWinnerLB(m, winnerId);
-            // perdant LB : éliminé
+            // perdant LB éliminé
         }
 
-        // 4) Bonus: si finale WB, +1 win au palmarès
-        const maxWB = await getMaxWinnerRound(m.tournament_id);
-        if (m.bracket_type === 'winner' && m.round === maxWB && winnerId) {
+        // 4) Bonus palmarès si finale WB
+        const plannedMax = await getPlannedWinnerFinalRound(m.tournament_id);
+        const thisRound = await fetchRound(m.tournament_id, 'winner', m.round);
+        const isFinal = m.bracket_type === 'winner' && (thisRound.length === 1 || m.round >= plannedMax);
+        if (isFinal) {
             const { data: prof } = await supabase
                 .from('profiles')
                 .select('wins')
@@ -322,15 +349,48 @@ export default function MatchList({
             const current = prof?.wins || 0;
             await supabase.from('profiles').update({ wins: current + 1 }).eq('id', winnerId);
         }
+    }
 
+    // ---------- Toolbar de validation ----------
+    const pendingCount = Object.keys(pending).length;
+
+    function selectWinner(m: M, winnerId: string) {
+        if (m.status === 'done') return;
+        setPending((prev) => ({ ...prev, [m.id]: winnerId }));
+    }
+
+    function clearPending() {
+        setPending({});
+    }
+
+    async function confirmPending() {
+        if (pendingCount === 0) return;
+
+        // Appliquer dans un ordre stable: WB avant LB, round croissant, slot croissant
+        const items: { m: M; winnerId: string }[] = [];
+        for (const [matchId, winnerId] of Object.entries(pending)) {
+            const m = matches.find((x) => x.id === matchId);
+            if (m && winnerId) items.push({ m, winnerId });
+        }
+
+        items.sort((a, b) => {
+            if (a.m.bracket_type !== b.m.bracket_type) {
+                return a.m.bracket_type === 'winner' ? -1 : 1;
+            }
+            if (a.m.round !== b.m.round) return a.m.round - b.m.round;
+            return a.m.slot - b.m.slot;
+        });
+
+        for (const it of items) {
+            await applyWinner(it.m, it.winnerId);
+        }
+
+        setPending({});
         await load();
-    };
+    }
 
     const reset = async (m: M) => {
-        await supabase
-            .from('matches')
-            .update({ winner: null, status: 'pending' })
-            .eq('id', m.id);
+        await supabase.from('matches').update({ winner: null, status: 'pending' }).eq('id', m.id);
         await load();
     };
 
@@ -357,6 +417,27 @@ export default function MatchList({
                     >
                         Copier
                     </button>
+                </div>
+            )}
+
+            {/* Toolbar validation */}
+            {canEdit && pendingCount > 0 && (
+                <div
+                    style={{
+                        display: 'flex',
+                        gap: 8,
+                        alignItems: 'center',
+                        background: '#0b1220',
+                        border: '1px solid #334155',
+                        padding: '8px 12px',
+                        borderRadius: 8,
+                    }}
+                >
+                    <span>{pendingCount} victoire(s) en attente</span>
+                    <button onClick={() => safeAction(confirmPending)} style={{ marginLeft: 'auto' }}>
+                        Confirmer
+                    </button>
+                    <button onClick={() => safeAction(clearPending)}>Annuler</button>
                 </div>
             )}
 
@@ -413,73 +494,95 @@ export default function MatchList({
                             Round {roundIdx}
                         </div>
 
-                        {items.map((m) => (
-                            <div
-                                key={m.id}
-                                style={{
-                                    border: '1px solid #ddd',
-                                    borderRadius: 10,
-                                    padding: 10,
-                                    background: '#111827',
-                                    color: 'white',
-                                }}
-                            >
-                                <div style={{ fontWeight: 600, marginBottom: 8 }}>Match {m.slot}</div>
+                        {items.map((m) => {
+                            const pendingWinner = pending[m.id];
+                            const isSelectedP1 = pendingWinner && pendingWinner === m.player1;
+                            const isSelectedP2 = pendingWinner && pendingWinner === m.player2;
 
-                                {/* joueurs */}
-                                <div style={{ display: 'grid', gap: 6 }}>
-                                    <div
-                                        style={{
-                                            display: 'flex',
-                                            justifyContent: 'space-between',
-                                            background: m.winner === m.player1 ? '#064e3b' : '#1f2937',
-                                            padding: '6px 8px',
-                                            borderRadius: 6,
-                                        }}
-                                    >
-                                        <span>{label(m.player1)}</span>
-                                        {canEdit && m.player1 && (
-                                            <button onClick={() => safeAction(() => setWinner(m, m.player1 as string))}>
-                                                Gagnant
-                                            </button>
-                                        )}
-                                    </div>
+                            return (
+                                <div
+                                    key={m.id}
+                                    style={{
+                                        border: '1px solid #ddd',
+                                        borderRadius: 10,
+                                        padding: 10,
+                                        background: '#111827',
+                                        color: 'white',
+                                    }}
+                                >
+                                    <div style={{ fontWeight: 600, marginBottom: 8 }}>Match {m.slot}</div>
 
-                                    <div
-                                        style={{
-                                            display: 'flex',
-                                            justifyContent: 'space-between',
-                                            background: m.winner === m.player2 ? '#064e3b' : '#1f2937',
-                                            padding: '6px 8px',
-                                            borderRadius: 6,
-                                        }}
-                                    >
-                                        <span>{label(m.player2)}</span>
-                                        {canEdit && m.player2 && (
-                                            <button onClick={() => safeAction(() => setWinner(m, m.player2 as string))}>
-                                                Gagnant
-                                            </button>
-                                        )}
-                                    </div>
-                                </div>
-
-                                {/* statut / actions */}
-                                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                                    {m.status === 'done' ? (
-                                        <div>
-                                            ✅ Vainqueur : <b>{label(m.winner)}</b>
+                                    {/* joueurs */}
+                                    <div style={{ display: 'grid', gap: 6 }}>
+                                        <div
+                                            style={{
+                                                display: 'flex',
+                                                justifyContent: 'space-between',
+                                                background:
+                                                    m.status === 'done'
+                                                        ? m.winner === m.player1
+                                                            ? '#064e3b'
+                                                            : '#1f2937'
+                                                        : isSelectedP1
+                                                            ? '#065f46'
+                                                            : '#1f2937',
+                                                padding: '6px 8px',
+                                                borderRadius: 6,
+                                            }}
+                                        >
+                                            <span>{label(m.player1)}</span>
+                                            {canEdit && m.player1 && m.status !== 'done' && (
+                                                <button onClick={() => safeAction(() => selectWinner(m, m.player1 as string))}>
+                                                    Gagnant
+                                                </button>
+                                            )}
                                         </div>
-                                    ) : (
-                                        <div style={{ opacity: 0.7 }}>—</div>
-                                    )}
-                                    {canEdit && (
-                                        <button style={{ marginLeft: 'auto' }} onClick={() => safeAction(() => reset(m))}>
-                                            Réinitialiser
-                                        </button>
-                                    )}
+
+                                        <div
+                                            style={{
+                                                display: 'flex',
+                                                justifyContent: 'space-between',
+                                                background:
+                                                    m.status === 'done'
+                                                        ? m.winner === m.player2
+                                                            ? '#064e3b'
+                                                            : '#1f2937'
+                                                        : isSelectedP2
+                                                            ? '#065f46'
+                                                            : '#1f2937',
+                                                padding: '6px 8px',
+                                                borderRadius: 6,
+                                            }}
+                                        >
+                                            <span>{label(m.player2)}</span>
+                                            {canEdit && m.player2 && m.status !== 'done' && (
+                                                <button onClick={() => safeAction(() => selectWinner(m, m.player2 as string))}>
+                                                    Gagnant
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                    {/* statut / actions */}
+                                    <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                                        {m.status === 'done' ? (
+                                            <div>
+                                                ✅ Vainqueur : <b>{label(m.winner)}</b>
+                                            </div>
+                                        ) : pendingWinner ? (
+                                            <div style={{ opacity: 0.9 }}>Sélectionné : {label(pendingWinner)}</div>
+                                        ) : (
+                                            <div style={{ opacity: 0.7 }}>—</div>
+                                        )}
+                                        {canEdit && (
+                                            <button style={{ marginLeft: 'auto' }} onClick={() => safeAction(() => reset(m))}>
+                                                Réinitialiser
+                                            </button>
+                                        )}
+                                    </div>
                                 </div>
-                            </div>
-                        ))}
+                            );
+                        })}
                     </div>
                 ))}
             </div>
