@@ -142,11 +142,12 @@ export default function MatchList({
 
     // ====== Participants & mode ======
     async function getParticipantsOrdered(tId: string): Promise<string[]> {
+        // On lit le smallest round winner et on récupère l’ordre par slot
         const { min } = await getAllRounds(tId, 'winner');
         const r1 = await fetchRound(tId, 'winner', Math.max(1, min || 1));
         const seen = new Set<string>();
         const ordered: string[] = [];
-        for (const m of r1) {
+        for (const m of r1.sort((a, b) => a.slot - b.slot)) {
             if (m.player1 && !seen.has(m.player1)) {
                 ordered.push(m.player1);
                 seen.add(m.player1);
@@ -319,25 +320,22 @@ export default function MatchList({
         }
     }
 
-    // ====== POULE (round-robin) ======
+    // ====== POULE (round-robin, robuste) ======
 
-    // Normalise le cercle: conserve l’ordre, garde **exactement un** BYE si nb impaire
-    function normalizeCircle(list: (string | null)[]): (string | null)[] {
-        const ids = list.filter((x): x is string => !!x);
-        // si nb impaire -> on ajoute un BYE (null)
-        if (ids.length % 2 === 1) return [...ids, null];
-        // nb paire -> pas de BYE
-        return ids;
-    }
-
-    // Construit l'arrangement initial à partir du Round 1 existant
-    async function buildInitialCircle(tId: string): Promise<(string | null)[]> {
+    // Seed canonique (Berger) respectant le Round 1 existant (par slots), avec exactement 1 BYE si impair
+    async function buildPoolSeed(tId: string): Promise<(string | null)[]> {
         const { min } = await getAllRounds(tId, 'winner');
         const r1 = await fetchRound(tId, 'winner', Math.max(1, min || 1));
+        // pairs du round 1 triés par slot
+        r1.sort((a, b) => a.slot - b.slot);
         const firsts = r1.map((m) => m.player1);
-        const seconds = r1.map((m) => m.player2).reverse();
-        const arr = normalizeCircle([...firsts, ...seconds]);
-        return arr;
+        const seconds = r1.map((m) => m.player2).reverse(); // pour que R1(DB) == R1(Berger)
+        const ids = [...firsts, ...seconds].filter((x): x is string | null => true);
+
+        // Normalisation: un seul BYE si impair
+        const players = ids.filter((x): x is string => !!x);
+        if (players.length % 2 === 1) return [...players, null];
+        return players;
     }
 
     function rotateOnce(circle: (string | null)[]) {
@@ -358,41 +356,98 @@ export default function MatchList({
         return pairs;
     }
 
+    function pairKey(a: string | null, b: string | null) {
+        if (!a || !b) return ''; // BYE -> pas de clé
+        return [a, b].sort().join('|');
+    }
+
+    async function playedPairsAtRound(tId: string, round: number) {
+        if (round < 1) return new Set<string>();
+        const prev = await fetchRound(tId, 'winner', round);
+        const keys = new Set<string>();
+        prev.forEach((m) => keys.add(pairKey(m.player1, m.player2)));
+        return keys;
+    }
+
+    async function countByesUpToRound(tId: string, uptoRound: number) {
+        const counts = new Map<string, number>();
+        for (let r = 1; r < uptoRound; r++) {
+            const ms = await fetchRound(tId, 'winner', r);
+            for (const m of ms) {
+                if (m.player1 && !m.player2) counts.set(m.player1, (counts.get(m.player1) || 0) + 1);
+                if (m.player2 && !m.player1) counts.set(m.player2, (counts.get(m.player2) || 0) + 1);
+            }
+        }
+        return counts;
+    }
+
     async function getPoolTotalRounds(tId: string): Promise<number> {
-        const parts = await getParticipantsOrdered(tId);
-        const nWithBye = parts.length % 2 === 0 ? parts.length : parts.length + 1;
+        const ids = await getParticipantsOrdered(tId);
+        const nWithBye = ids.length % 2 === 0 ? ids.length : ids.length + 1;
         return Math.max(1, nWithBye - 1);
     }
 
-    // Crée le round N (si manquant) avec les bonnes paires
+    // Crée/écrit le round N (évite rematch immédiat + équilibre BYE)
     async function ensurePoolRound(tId: string, round: number) {
-        const total = await getPoolTotalRounds(tId);
+        const seed = await buildPoolSeed(tId);
+        const total = Math.max(1, seed.length - 1);
         if (round < 1 || round > total) return;
 
-        let circle = await buildInitialCircle(tId);
+        let circle = seed.slice();
         for (let r = 2; r <= round; r++) circle = rotateOnce(circle);
-        const pairs = pairsFromCircle(circle);
 
+        const prevPairs = await playedPairsAtRound(tId, round - 1);
+        const byeCounts = await countByesUpToRound(tId, round);
+        const allPlayers = seed.filter(Boolean) as string[];
+        const minBye = allPlayers.reduce((m, p) => Math.min(m, byeCounts.get(p) || 0), Infinity);
+
+        let tries = 0;
+        while (tries < circle.length) {
+            const pairs = pairsFromCircle(circle);
+            const hasImmediateRematch = pairs.some(([a, b]) => prevPairs.has(pairKey(a, b)));
+            const byePair = pairs.find(([a, b]) => a === null || b === null);
+            const byePlayer = byePair ? (byePair[0] || byePair[1]) : null;
+            const byeOverUsed = byePlayer ? ((byeCounts.get(byePlayer) || 0) > minBye) : false;
+
+            if (!hasImmediateRematch && !byeOverUsed) {
+                // écrire
+                let slot = 1;
+                for (const [a, b] of pairs) {
+                    await setPlayersExact(tId, 'winner', round, slot, a, b);
+                    slot++;
+                }
+                return;
+            }
+            circle = rotateOnce(circle);
+            tries++;
+        }
+
+        // fallback (ne devrait pas arriver)
         let slot = 1;
-        for (const [a, b] of pairs) {
+        for (const [a, b] of pairsFromCircle(circle)) {
             await setPlayersExact(tId, 'winner', round, slot, a, b);
             slot++;
         }
     }
 
-    // Si un round est entièrement terminé et le suivant n’existe pas, on le crée
+    // Avance la poule round-par-round
     async function ensurePoolProgress(tId: string) {
-        const total = await getPoolTotalRounds(tId);
+        const seed = await buildPoolSeed(tId);
+        const total = Math.max(1, seed.length - 1);
         const { min, max } = await getAllRounds(tId, 'winner');
         const start = Math.max(1, min || 1);
-        for (let r = start; r <= Math.max(max, start); r++) {
+        const currentMax = Math.max(max, start);
+
+        for (let r = start; r <= currentMax; r++) {
             const curr = await fetchRound(tId, 'winner', r);
             if (curr.length === 0) break;
             const allDone = curr.every((m) => m.status === 'done');
             if (!allDone) return;
             if (r - start + 1 < total) {
                 const next = await fetchRound(tId, 'winner', r + 1);
-                if (next.length === 0) await ensurePoolRound(tId, r + 1);
+                if (next.length === 0) {
+                    await ensurePoolRound(tId, r + 1);
+                }
             }
         }
     }
@@ -478,7 +533,7 @@ export default function MatchList({
     async function computePodium() {
         const isBracket = await isBracketMode(tournamentId);
 
-        // ===== Bracket : finale WB + petite finale LB
+        // ===== Bracket
         if (isBracket) {
             const { max } = await getAllRounds(tournamentId, 'winner');
             let gold: string | null | undefined = null;
@@ -504,7 +559,7 @@ export default function MatchList({
                     .eq('round', 3)
                     .eq('slot', 1)
                     .limit(1);
-                const lb = lb3?.[0] as M | undefined;
+                const lb = (lb3?.[0] as M | undefined);
                 if (lb && lb.status === 'done' && lb.winner) {
                     bronze = lb.winner;
                     const opp = lb.winner === lb.player1 ? lb.player2 : lb.player1;
@@ -516,10 +571,10 @@ export default function MatchList({
             return;
         }
 
-        // ===== Poule : classe par victoires + match d’appui si égalité 1er/2e
+        // ===== Poule : classement victoires + éventuel match d’appui
         const totalRounds = await getPoolTotalRounds(tournamentId);
 
-        // s'il existe un round "play-off" (totalRounds+1), et qu'il est joué, on l'utilise
+        // Play-off déjà joué ?
         const playoff = await fetchRound(tournamentId, 'winner', totalRounds + 1);
         if (playoff.length >= 1 && playoff[0].status === 'done') {
             const f = playoff[0];
@@ -535,7 +590,7 @@ export default function MatchList({
             return;
         }
 
-        // sinon, classement par victoires sur le bracket winner uniquement
+        // Classement par victoires (winner bracket uniquement)
         const { data: all } = await supabase
             .from('matches')
             .select('winner,status')
@@ -555,9 +610,8 @@ export default function MatchList({
         const second = ordered[1];
 
         if (first && second && first[1] === second[1]) {
-            // égalité -> créer le match d’appui si absent
-            const existing = await fetchRound(tournamentId, 'winner', totalRounds + 1);
-            if (existing.length === 0) {
+            // créer match d’appui si absent
+            if (playoff.length === 0) {
                 await setPlayersExact(tournamentId, 'winner', totalRounds + 1, 1, first[0], second[0]);
             }
             setPodium({
@@ -597,10 +651,26 @@ export default function MatchList({
                     }}
                 >
                     <div style={{ fontWeight: 700 }}>🏁 Tournoi terminé — Podium</div>
-                    {'gold' in (podium || {}) && <div>🥇 1er : <b>{label(podium.gold ?? null)}</b></div>}
-                    {'silver' in (podium || {}) && <div>🥈 2e : <b>{label(podium.silver ?? null)}</b></div>}
-                    {'bronze' in (podium || {}) && <div>🥉 3e : <b>{label(podium.bronze ?? null)}</b></div>}
-                    {podium.fourth && <div>4e : <b>{label(podium.fourth)}</b></div>}
+                    {'gold' in (podium || {}) && (
+                        <div>
+                            🥇 1er : <b>{label(podium.gold ?? null)}</b>
+                        </div>
+                    )}
+                    {'silver' in (podium || {}) && (
+                        <div>
+                            🥈 2e : <b>{label(podium.silver ?? null)}</b>
+                        </div>
+                    )}
+                    {'bronze' in (podium || {}) && (
+                        <div>
+                            🥉 3e : <b>{label(podium.bronze ?? null)}</b>
+                        </div>
+                    )}
+                    {podium.fourth && (
+                        <div>
+                            4e : <b>{label(podium.fourth)}</b>
+                        </div>
+                    )}
                     {podium.note && <div style={{ opacity: 0.8, fontSize: 12 }}>{podium.note}</div>}
                 </div>
             )}
