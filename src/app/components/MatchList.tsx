@@ -325,7 +325,7 @@ export default function MatchList({
         return winners;
     }
 
-    // --- Pairing alterné + blocage de la finale WB ---
+    // ➜ remplace ta version existante
     async function ensureLoserRound(r: number) {
         // On ne nourrit **pas** le LB avec les perdants de la finale WB.
         const wbMax = await getMaxRound('winner');
@@ -384,42 +384,15 @@ export default function MatchList({
         }
     }
 
-    // --- Petite finale (3e place) : dernier survivant LB vs dernier perdant WB avant la finale
-    async function scheduleThirdPlaceIfReady() {
-        const wbMax = await getMaxRound('winner');
-        if (wbMax < 2) return; // pas de pré-finale WB
-
-        const lastLb = await getMaxRound('loser');
-        if (lastLb < (wbMax - 1)) return; // LB pas encore au niveau requis
-
-        const lbWinners = await getWinnersOfLBRound(lastLb);
-        if (!lbWinners || lbWinners.length !== 1) return; // besoin d'un seul survivant LB
-
-        const wbPreFinal = await fetchRound('winner', wbMax - 1);
-        if (wbPreFinal.length === 0 || wbPreFinal.some(m => m.status !== 'done')) return;
-
-        // perdant du "dernier" match de pré-finale WB (slot max)
-        const mLast = wbPreFinal.reduce((acc, m) => (m.slot > acc.slot ? m : acc), wbPreFinal[0]);
-        const preFinalLoser = mLast.winner === mLast.player1 ? mLast.player2 : mLast.player1;
-        if (!preFinalLoser) return;
-
-        // évite doublon de création
-        const maybeExisting = await fetchRound('loser', lastLb + 1);
-        if (maybeExisting.length > 0) return;
-
-        // crée la petite finale (LB round lastLb+1, slot 1)
-        await setPlayers(lastLb + 1, 1, lbWinners[0], preFinalLoser, 'loser');
-    }
 
     async function rebuildLoserProgression() {
         const wbMax = await getMaxRound('winner');
         if (wbMax === 0) return;
-        // On nourrit le LB **jusqu’au round (wbMax - 1)** uniquement
-        for (let r = 1; r <= wbMax - 1; r++) {
+        for (let r = 1; r <= wbMax; r++) {
             await ensureLoserRound(r);
         }
-        // Puis on tente de programmer la "petite finale" (3ᵉ place)
-        await scheduleThirdPlaceIfReady();
+        // Optionnel : si WB final terminé et LB dernier round terminé, tu peux considérer
+        // le vainqueur LB = 3e place (petite finale).
     }
 
     /* ============================
