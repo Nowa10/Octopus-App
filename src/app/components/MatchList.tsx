@@ -27,7 +27,7 @@ type M = {
 };
 
 /* ============================
-   Utils purs
+   Utils
    ============================ */
 function nextPowerOfTwo(n: number) { let p = 1; while (p < n) p <<= 1; return p; }
 
@@ -60,8 +60,15 @@ function serpentineSplit(ids: string[], K: number) {
     return pools;
 }
 
-/* Bracket autorisé 2..32 (BYE si besoin) */
-function bracketAllowed(n: number) { return n >= 2 && n <= 32; }
+// liste autorisée pour générer un bracket directement
+function bracketAllowed(n: number) {
+    if (n === 4) return true;
+    if (n >= 7 && n <= 8) return true;
+    if (n >= 11 && n <= 12) return true;
+    if (n >= 15 && n <= 16) return true;
+    if (n === 32) return true;
+    return false;
+}
 
 /* ============================
    Composant
@@ -76,7 +83,7 @@ export default function MatchList({
     const [matches, setMatches] = useState<M[]>([]);
     const [people, setPeople] = useState<Record<string, P>>({});
 
-    // Mode UI local (plus de dépendance à la table tournaments)
+    // Mode UI local (aucune dépendance à "tournaments")
     const [uiMode, setUiMode] = useState<'none' | 'pool' | 'bracket'>('none');
 
     // Onglets Bracket
@@ -90,35 +97,37 @@ export default function MatchList({
     }>({ labels: [], idsByPool: [], roundsByPool: [] });
     const [activePoolTab, setActivePoolTab] = useState<string | null>(null);
 
-    // Sélection groupée
+    // Sélection groupée de gagnants
     const [pending, setPending] = useState<Record<string, string>>({});
     const pendingCount = Object.keys(pending).length;
+
+    // Sélection des participants (nouveau)
+    const [rosterIds, setRosterIds] = useState<string[]>([]);
+    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
     /* ============================
        I/O
        ============================ */
     const load = useCallback(async () => {
         // matches
-        const { data: m, error: mErr } = await supabase
+        const { data: m } = await supabase
             .from('matches').select('*')
             .eq('tournament_id', tournamentId)
             .order('round').order('slot');
-        if (mErr) setInfo(`Erreur matches: ${mErr.message}`);
-        setMatches((m ?? []) as M[]);
+        setMatches(((m ?? []) as unknown) as M[]);
 
-        // profiles (pour labels)
-        const { data: ps, error: pErr } = await supabase
+        // profiles
+        const { data: ps } = await supabase
             .from('profiles').select('id,first_name,last_name,wins');
-        if (pErr) setInfo(`Erreur profiles: ${pErr.message}`);
         const map: Record<string, P> = {};
-        (ps ?? []).forEach((p) => { const pp = p as P; map[pp.id] = pp; });
+        (ps ?? []).forEach((p) => { const pp = (p as unknown) as P; map[pp.id] = pp; });
         setPeople(map);
     }, [tournamentId]);
 
     useEffect(() => { void load(); }, [load]);
 
     async function getRoster(): Promise<string[]> {
-        // 1) table participants si dispo
+        // 1) participants (si table dispo)
         const { data: r1, error: e1 } = await supabase
             .from('tournament_participants')
             .select('profile_id')
@@ -127,7 +136,7 @@ export default function MatchList({
             const ids1 = (r1 ?? []).map((r) => (r as { profile_id: string }).profile_id);
             if (ids1.length > 0) return ids1;
         }
-        // 2) fallback via matches existants
+        // 2) fallback via matches
         const { data: r2 } = await supabase
             .from('matches').select('player1,player2').eq('tournament_id', tournamentId);
         type Row = { player1: string | null; player2: string | null };
@@ -136,6 +145,16 @@ export default function MatchList({
         return [...set];
     }
 
+    // charge roster + init sélection
+    useEffect(() => {
+        (async () => {
+            const ids = await getRoster();
+            setRosterIds(ids);
+            setSelectedIds(new Set(ids)); // par défaut: tout coché
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [tournamentId]);
+
     async function fetchRound(bracket: 'winner' | 'loser', round: number): Promise<M[]> {
         const { data } = await supabase
             .from('matches').select('*')
@@ -143,7 +162,7 @@ export default function MatchList({
             .eq('bracket_type', bracket)
             .eq('round', round)
             .order('slot', { ascending: true });
-        return (data ?? []) as M[];
+        return ((data ?? []) as unknown) as M[];
     }
 
     async function getWBMaxRound(): Promise<number> {
@@ -163,9 +182,9 @@ export default function MatchList({
             .eq('round', round)
             .eq('slot', slot)
             .limit(1);
-        if (existing && existing[0]) return existing[0] as M;
+        if (existing && existing[0]) return (existing[0] as unknown) as M;
 
-        const { data, error } = await supabase
+        const { data } = await supabase
             .from('matches')
             .insert({
                 tournament_id: tournamentId, bracket_type: bracket,
@@ -173,11 +192,14 @@ export default function MatchList({
                 player1: null, player2: null, winner: null,
             })
             .select('*').single();
-        if (error) throw error;
-        return data as M;
+        return (data as unknown) as M;
     }
 
-    async function setPlayers(round: number, slot: number, p1: string | null, p2: string | null, bracket: 'winner' | 'loser' = 'winner') {
+    async function setPlayers(
+        round: number, slot: number,
+        p1: string | null, p2: string | null,
+        bracket: 'winner' | 'loser' = 'winner'
+    ) {
         const m = await ensureMatch(round, slot, bracket);
         await supabase.from('matches').update({ player1: p1, player2: p2 }).eq('id', m.id);
     }
@@ -209,7 +231,7 @@ export default function MatchList({
                 for (let g = 0; g < roundsRR.length; g++) {
                     let slot = 1;
                     for (const [a, b] of roundsRR[g]) {
-                        if (!a || !b) continue; // on ne stocke pas les BYE
+                        if (!a || !b) continue; // pas de BYE en DB
                         await setPlayers(nextRound, slot++, a, b, 'winner');
                     }
                     roundsByPool[p].push(nextRound);
@@ -231,46 +253,59 @@ export default function MatchList({
     }
 
     /* ============================
-       Génération — BRACKET
-       (R1 SEULEMENT ; rounds suivants créés après “Confirmer”)
+       Génération — BRACKET (R1 uniquement)
        ============================ */
+    async function generateBracketFromList(list: string[]) {
+        const n = list.length;
+        if (!bracketAllowed(n)) {
+            setInfo(`La taille ${n} n’est pas autorisée pour un bracket direct. (Autorisé: 4, 7–8, 11–12, 15–16, 32).`);
+            return;
+        }
+
+        await clearAllMatches();
+
+        const size = nextPowerOfTwo(n);
+        const pairs: Array<[string | null, string | null]> = [];
+        for (let i = 0; i < size / 2; i++) {
+            const a = i + 1, b = size - i;
+            pairs.push([list[a - 1] ?? null, list[b - 1] ?? null]);
+        }
+
+        let slot = 1;
+        for (const [p1, p2] of pairs) {
+            await setPlayers(1, slot, p1, p2, 'winner');
+            // auto-win si BYE
+            if (p1 && !p2) {
+                await supabase.from('matches').update({ winner: p1, status: 'done' })
+                    .eq('tournament_id', tournamentId).eq('bracket_type', 'winner').eq('round', 1).eq('slot', slot);
+            } else if (!p1 && p2) {
+                await supabase.from('matches').update({ winner: p2, status: 'done' })
+                    .eq('tournament_id', tournamentId).eq('bracket_type', 'winner').eq('round', 1).eq('slot', slot);
+            }
+            slot++;
+        }
+
+        setUiMode('bracket');
+        await load();
+        setInfo('Bracket (Round 1) générée. Valide les gagnants pour créer le round suivant.');
+    }
+
     async function generateBracketFromRoster() {
         setInfo(null);
         setIsBuilding(true);
         try {
             const roster = await getRoster();
-            const n = roster.length;
-            if (!bracketAllowed(n)) { setInfo(`Taille ${n} non supportée (2..32).`); return; }
+            await generateBracketFromList(roster);
+        } finally { setIsBuilding(false); }
+    }
 
-            await clearAllMatches();
-
-            const size = nextPowerOfTwo(n);
-            const pairs: Array<[string | null, string | null]> = [];
-            for (let i = 0; i < size / 2; i++) {
-                const a = i + 1, b = size - i;
-                const s1 = roster[a - 1] ?? null;
-                const s2 = roster[b - 1] ?? null;
-                pairs.push([s1, s2]);
-            }
-
-            let slot = 1;
-            for (const [p1, p2] of pairs) {
-                await setPlayers(1, slot, p1, p2, 'winner');
-                if (p1 && !p2) {
-                    await supabase.from('matches').update({ winner: p1, status: 'done' })
-                        .eq('tournament_id', tournamentId).eq('bracket_type', 'winner').eq('round', 1).eq('slot', slot);
-                } else if (!p1 && p2) {
-                    await supabase.from('matches').update({ winner: p2, status: 'done' })
-                        .eq('tournament_id', tournamentId).eq('bracket_type', 'winner').eq('round', 1).eq('slot', slot);
-                }
-                slot++;
-            }
-
-            // ne pas créer les tours suivants ici
-            setUiMode('bracket');
-
-            await load();
-            setInfo('Bracket (Round 1) générée. Valide les gagnants pour créer le round suivant.');
+    async function generateBracketFromSelection() {
+        setInfo(null);
+        setIsBuilding(true);
+        try {
+            const list = Array.from(selectedIds);
+            if (list.length < 2) { setInfo('Sélection insuffisante (min 2).'); return; }
+            await generateBracketFromList(list);
         } finally { setIsBuilding(false); }
     }
 
@@ -302,14 +337,18 @@ export default function MatchList({
         const max = await getWBMaxRound();
         if (max === 0) return;
 
-        const current = await fetchRound('winner', max); // déjà ordonné par slot
-        if (current.length === 1 && current[0].status === 'done') return; // finale finie
+        const current = await fetchRound('winner', max);
+        // finale finie => rien
+        if (current.length === 1 && current[0].status === 'done') return;
 
-        if (current.some((m) => m.status !== 'done')) return; // pas fini → stop
+        // si pas tout "done", on attend
+        if (current.some((m) => m.status !== 'done')) return;
 
+        // si le round suivant existe déjà, on sort
         const next = await fetchRound('winner', max + 1);
-        if (next.length > 0) return; // déjà créé
+        if (next.length > 0) return;
 
+        // crée le round suivant à partir des vainqueurs
         let slot = 1;
         for (let i = 0; i + 1 < current.length; i += 2) {
             const w1 = current[i].winner ?? null;
@@ -321,7 +360,7 @@ export default function MatchList({
     /* ============================
        Sélection / Validation / Reset
        ============================ */
-    const label = (id: string | null) =>
+    const nameOf = (id: string | null) =>
         id ? `${people[id]?.first_name || '?'} ${people[id]?.last_name || ''}` : 'BYE';
 
     function selectWinner(m: M, winnerId: string) {
@@ -339,7 +378,7 @@ export default function MatchList({
                 const m = matches.find((x) => x.id === id);
                 if (m && w) items.push({ m, winnerId: w });
             }
-            // winner d'abord, rondes croissantes
+            // Winner d'abord, round croissant, puis slot
             items.sort((a, b) => {
                 if (a.m.bracket_type !== b.m.bracket_type) return a.m.bracket_type === 'winner' ? -1 : 1;
                 if (a.m.round !== b.m.round) return a.m.round - b.m.round;
@@ -372,33 +411,33 @@ export default function MatchList({
     /* ============================
        Vues (groupements par round)
        ============================ */
-    const filteredWinnerMatches = useMemo(
+    const winnerMatches = useMemo(
         () => matches.filter((m) => m.bracket_type === 'winner'),
         [matches]
     );
-    const filteredLoserMatches = useMemo(
+    const loserMatches = useMemo(
         () => matches.filter((m) => m.bracket_type === 'loser'),
         [matches]
     );
 
     // En mode POOL, on filtre par onglet sélectionné
     const poolMatchesForUI = useMemo(() => {
-        if (uiMode !== 'pool') return filteredWinnerMatches;
-        if (!activePoolTab || poolTabs.labels.length === 0) return filteredWinnerMatches;
+        if (uiMode !== 'pool') return winnerMatches;
+        if (!activePoolTab || poolTabs.labels.length === 0) return winnerMatches;
         if (activePoolTab === 'Playoffs') return [] as M[];
 
         const idx = poolTabs.labels.indexOf(activePoolTab);
-        if (idx === -1) return filteredWinnerMatches;
+        if (idx === -1) return winnerMatches;
 
         const idsSet = new Set(poolTabs.idsByPool[idx] || []);
         const roundsSet = new Set(poolTabs.roundsByPool[idx] || []);
-        return filteredWinnerMatches.filter(
+        return winnerMatches.filter(
             (m) => m.player1 && m.player2 && idsSet.has(m.player1) && idsSet.has(m.player2) && roundsSet.has(m.round)
         );
-    }, [uiMode, filteredWinnerMatches, activePoolTab, poolTabs]);
+    }, [uiMode, winnerMatches, activePoolTab, poolTabs]);
 
     const roundsWB = useMemo(() => {
-        const src = uiMode === 'pool' ? poolMatchesForUI : filteredWinnerMatches;
+        const src = uiMode === 'pool' ? poolMatchesForUI : winnerMatches;
         const byRound = new Map<number, M[]>();
         for (const m of src) {
             if (!byRound.has(m.round)) byRound.set(m.round, []);
@@ -406,23 +445,39 @@ export default function MatchList({
         }
         for (const r of byRound.keys()) byRound.get(r)!.sort((a, b) => a.slot - b.slot);
         return [...byRound.entries()].sort((a, b) => a[0] - b[0]);
-    }, [uiMode, poolMatchesForUI, filteredWinnerMatches]);
+    }, [uiMode, poolMatchesForUI, winnerMatches]);
 
     const roundsLB = useMemo(() => {
         const byRound = new Map<number, M[]>();
-        for (const m of filteredLoserMatches) {
+        for (const m of loserMatches) {
             if (!byRound.has(m.round)) byRound.set(m.round, []);
             byRound.get(m.round)!.push(m);
         }
         for (const r of byRound.keys()) byRound.get(r)!.sort((a, b) => a.slot - b.slot);
         return [...byRound.entries()].sort((a, b) => a[0] - b[0]);
-    }, [filteredLoserMatches]);
+    }, [loserMatches]);
 
     /* ============================
        UI
        ============================ */
     return (
         <div className="container stack">
+            {/* Notice / explications simples */}
+            <div className="card">
+                <div className="card__content stack" style={{ gap: 8 }}>
+                    <div style={{ fontWeight: 700 }}>Comment ça marche</div>
+                    <ul style={{ margin: 0, paddingLeft: 18 }}>
+                        <li><b>Vider les matchs</b> remet le tableau à zéro.</li>
+                        <li><b>Générer une bracket</b> crée <b>uniquement le Round 1</b>. Valide tous les gagnants, puis clique <b>Confirmer</b> pour faire apparaître le round suivant. Le <b>loser bracket</b> se crée automatiquement à la fin de chaque round WB.</li>
+                        <li><b>Poules</b>: Génère 2/3/4 poules (Round Robin). Onglets <b>Pool 1..K</b> + <b>Playoffs</b> (placeholder).</li>
+                        <li><b>Sélection de participants</b>: coche/décoche qui participe, puis <b>Générer une bracket (sélection)</b> pour, par ex., faire un top 4 après les poules.</li>
+                    </ul>
+                    <div style={{ fontSize: 12, opacity: 0.8 }}>
+                        Limites actuelles: pas de génération auto des Playoffs depuis les poules (volontaire). Les tailles de bracket direct autorisées: 4, 7–8, 11–12, 15–16, 32.
+                    </div>
+                </div>
+            </div>
+
             {/* Actions MANUELLES */}
             <div className="card">
                 <div className="card__content hstack" style={{ gap: 8, flexWrap: 'wrap' }}>
@@ -447,7 +502,7 @@ export default function MatchList({
                                 Vider les matchs
                             </Button>
 
-                            <Button variant="primary" onClick={() => generateBracketFromRoster()}>
+                            <Button variant="primary" onClick={() => { setIsBuilding(true); generateBracketFromRoster().finally(() => setIsBuilding(false)); }}>
                                 Générer une bracket
                             </Button>
 
@@ -458,6 +513,46 @@ export default function MatchList({
                     )}
                 </div>
             </div>
+
+            {/* Sélection des participants (checkboxes) */}
+            {canEdit && (
+                <div className="card">
+                    <div className="card__content stack" style={{ gap: 10 }}>
+                        <div className="hstack" style={{ gap: 8, flexWrap: 'wrap' }}>
+                            <div style={{ fontWeight: 700 }}>Sélection des participants</div>
+                            <span className="spacer" />
+                            <Button variant="ghost" onClick={() => setSelectedIds(new Set(rosterIds))}>Tout cocher</Button>
+                            <Button variant="ghost" onClick={() => setSelectedIds(new Set())}>Tout décocher</Button>
+                            <Button variant="primary" onClick={() => generateBracketFromSelection()}>
+                                Générer une bracket (sélection)
+                            </Button>
+                        </div>
+
+                        <div className="grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(220px,1fr))', gap: 8 }}>
+                            {rosterIds.map((id) => {
+                                const checked = selectedIds.has(id);
+                                return (
+                                    <label key={id} className="hstack" style={{ gap: 8 }}>
+                                        <input
+                                            type="checkbox"
+                                            checked={checked}
+                                            onChange={(e) => {
+                                                setSelectedIds((prev) => {
+                                                    const next = new Set(prev);
+                                                    if (e.target.checked) next.add(id); else next.delete(id);
+                                                    return next;
+                                                });
+                                            }}
+                                        />
+                                        <span>{nameOf(id)}</span>
+                                    </label>
+                                );
+                            })}
+                            {rosterIds.length === 0 && <div style={{ opacity: 0.7 }}>Aucun participant détecté.</div>}
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Info & loader */}
             {info && (
@@ -505,18 +600,14 @@ export default function MatchList({
 
             {/* Grille des rounds */}
             <div className="rounds">
-                {/* Winner side (ou Pools) */}
-                {((uiMode === 'pool' && (activePoolTab ?? '')) !== 'Playoffs') && roundsWB.map(([roundIdx, items]) => (
-                    <div key={`wb-${roundIdx}`} className="stack">
-                        <div className="round-title">
-                            {uiMode === 'pool' ? `Round ${roundIdx} — ${activePoolTab}` : `Round ${roundIdx}`}
-                        </div>
-
+                {/* POOLS ou WINNER (selon mode/onglet) */}
+                {uiMode === 'pool' && (activePoolTab ?? '') !== 'Playoffs' && roundsWB.map(([roundIdx, items]) => (
+                    <div key={`pool-${roundIdx}`} className="stack">
+                        <div className="round-title">Round {roundIdx} — {activePoolTab}</div>
                         {items.map((m) => {
                             const pendingWinner = pending[m.id];
                             const isSelectedP1 = !!pendingWinner && pendingWinner === m.player1;
                             const isSelectedP2 = !!pendingWinner && pendingWinner === m.player2;
-
                             return (
                                 <div key={m.id} className="card">
                                     <div className="card__content stack">
@@ -524,29 +615,122 @@ export default function MatchList({
                                             <div style={{ fontWeight: 700 }}>Match {m.slot}</div>
                                             <span className="spacer" />
                                             {m.status === 'done'
-                                                ? <span className="badge">Vainqueur : <b>{label(m.winner)}</b></span>
+                                                ? <span className="badge">Vainqueur : <b>{nameOf(m.winner)}</b></span>
                                                 : pendingWinner
-                                                    ? <span style={{ opacity: 0.9 }}>Sélectionné : {label(pendingWinner)}</span>
+                                                    ? <span style={{ opacity: 0.9 }}>Sélectionné : {nameOf(pendingWinner)}</span>
                                                     : <span style={{ opacity: 0.6 }}>—</span>
                                             }
                                         </div>
-
                                         <div className="stack">
                                             <div className={`matchline ${m.status === 'done' && m.winner === m.player1 ? 'is-winner' : ''} ${isSelectedP1 ? 'is-pending' : ''}`}>
-                                                <span>{label(m.player1)}</span>
+                                                <span>{nameOf(m.player1)}</span>
                                                 {canEdit && m.player1 && m.status !== 'done' && (
                                                     <Button size="sm" variant="ghost" onClick={() => selectWinner(m, m.player1 as string)}>Gagnant</Button>
                                                 )}
                                             </div>
-
                                             <div className={`matchline ${m.status === 'done' && m.winner === m.player2 ? 'is-winner' : ''} ${isSelectedP2 ? 'is-pending' : ''}`}>
-                                                <span>{label(m.player2)}</span>
+                                                <span>{nameOf(m.player2)}</span>
                                                 {canEdit && m.player2 && m.status !== 'done' && (
                                                     <Button size="sm" variant="ghost" onClick={() => selectWinner(m, m.player2 as string)}>Gagnant</Button>
                                                 )}
                                             </div>
                                         </div>
+                                        {canEdit && (
+                                            <div className="hstack" style={{ marginTop: 8 }}>
+                                                <span className="spacer" />
+                                                <Button size="sm" variant="danger" onClick={() => resetMatch(m)}>Réinitialiser</Button>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                ))}
 
+                {/* BRACKET — WINNER uniquement si onglet Winner */}
+                {uiMode === 'bracket' && activeBracket === 'winner' && roundsWB.map(([roundIdx, items]) => (
+                    <div key={`wb-${roundIdx}`} className="stack">
+                        <div className="round-title">Round {roundIdx}</div>
+                        {items.map((m) => {
+                            const pendingWinner = pending[m.id];
+                            const isSelectedP1 = !!pendingWinner && pendingWinner === m.player1;
+                            const isSelectedP2 = !!pendingWinner && pendingWinner === m.player2;
+                            return (
+                                <div key={m.id} className="card">
+                                    <div className="card__content stack">
+                                        <div className="hstack">
+                                            <div style={{ fontWeight: 700 }}>Match {m.slot}</div>
+                                            <span className="spacer" />
+                                            {m.status === 'done'
+                                                ? <span className="badge">Vainqueur : <b>{nameOf(m.winner)}</b></span>
+                                                : pendingWinner
+                                                    ? <span style={{ opacity: 0.9 }}>Sélectionné : {nameOf(pendingWinner)}</span>
+                                                    : <span style={{ opacity: 0.6 }}>—</span>
+                                            }
+                                        </div>
+                                        <div className="stack">
+                                            <div className={`matchline ${m.status === 'done' && m.winner === m.player1 ? 'is-winner' : ''} ${isSelectedP1 ? 'is-pending' : ''}`}>
+                                                <span>{nameOf(m.player1)}</span>
+                                                {canEdit && m.player1 && m.status !== 'done' && (
+                                                    <Button size="sm" variant="ghost" onClick={() => selectWinner(m, m.player1 as string)}>Gagnant</Button>
+                                                )}
+                                            </div>
+                                            <div className={`matchline ${m.status === 'done' && m.winner === m.player2 ? 'is-winner' : ''} ${isSelectedP2 ? 'is-pending' : ''}`}>
+                                                <span>{nameOf(m.player2)}</span>
+                                                {canEdit && m.player2 && m.status !== 'done' && (
+                                                    <Button size="sm" variant="ghost" onClick={() => selectWinner(m, m.player2 as string)}>Gagnant</Button>
+                                                )}
+                                            </div>
+                                        </div>
+                                        {canEdit && (
+                                            <div className="hstack" style={{ marginTop: 8 }}>
+                                                <span className="spacer" />
+                                                <Button size="sm" variant="danger" onClick={() => resetMatch(m)}>Réinitialiser</Button>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                ))}
+
+                {/* BRACKET — LOSER uniquement si onglet Loser (FIX: n'affiche que le loser) */}
+                {uiMode === 'bracket' && activeBracket === 'loser' && roundsLB.map(([roundIdx, items]) => (
+                    <div key={`lb-${roundIdx}`} className="stack">
+                        <div className="round-title">Loser Round {roundIdx}</div>
+                        {items.map((m) => {
+                            const pendingWinner = pending[m.id];
+                            const isSelectedP1 = !!pendingWinner && pendingWinner === m.player1;
+                            const isSelectedP2 = !!pendingWinner && pendingWinner === m.player2;
+                            return (
+                                <div key={m.id} className="card">
+                                    <div className="card__content stack">
+                                        <div className="hstack">
+                                            <div style={{ fontWeight: 700 }}>Match {m.slot}</div>
+                                            <span className="spacer" />
+                                            {m.status === 'done'
+                                                ? <span className="badge">Vainqueur : <b>{nameOf(m.winner)}</b></span>
+                                                : pendingWinner
+                                                    ? <span style={{ opacity: 0.9 }}>Sélectionné : {nameOf(pendingWinner)}</span>
+                                                    : <span style={{ opacity: 0.6 }}>—</span>
+                                            }
+                                        </div>
+                                        <div className="stack">
+                                            <div className={`matchline ${m.status === 'done' && m.winner === m.player1 ? 'is-winner' : ''} ${isSelectedP1 ? 'is-pending' : ''}`}>
+                                                <span>{nameOf(m.player1)}</span>
+                                                {canEdit && m.player1 && m.status !== 'done' && (
+                                                    <Button size="sm" variant="ghost" onClick={() => selectWinner(m, m.player1 as string)}>Gagnant</Button>
+                                                )}
+                                            </div>
+                                            <div className={`matchline ${m.status === 'done' && m.winner === m.player2 ? 'is-winner' : ''} ${isSelectedP2 ? 'is-pending' : ''}`}>
+                                                <span>{nameOf(m.player2)}</span>
+                                                {canEdit && m.player2 && m.status !== 'done' && (
+                                                    <Button size="sm" variant="ghost" onClick={() => selectWinner(m, m.player2 as string)}>Gagnant</Button>
+                                                )}
+                                            </div>
+                                        </div>
                                         {canEdit && (
                                             <div className="hstack" style={{ marginTop: 8 }}>
                                                 <span className="spacer" />
@@ -564,66 +748,13 @@ export default function MatchList({
                 {uiMode === 'pool' && (activePoolTab === 'Playoffs') && (
                     <div className="card">
                         <div className="card__content">
-                            <b>Playoffs</b> — (désactivé pour l’instant).
+                            <b>Playoffs</b> — (désactivé pour l’instant). Utilise la sélection ci-dessus pour créer un bracket manuellement.
                         </div>
                     </div>
                 )}
 
-                {/* Loser side (bracket uniquement) */}
-                {uiMode === 'bracket' && activeBracket === 'loser' && roundsLB.map(([roundIdx, items]) => (
-                    <div key={`lb-${roundIdx}`} className="stack">
-                        <div className="round-title">Loser Round {roundIdx}</div>
-
-                        {items.map((m) => {
-                            const pendingWinner = pending[m.id];
-                            const isSelectedP1 = !!pendingWinner && pendingWinner === m.player1;
-                            const isSelectedP2 = !!pendingWinner && pendingWinner === m.player2;
-
-                            return (
-                                <div key={m.id} className="card">
-                                    <div className="card__content stack">
-                                        <div className="hstack">
-                                            <div style={{ fontWeight: 700 }}>Match {m.slot}</div>
-                                            <span className="spacer" />
-                                            {m.status === 'done'
-                                                ? <span className="badge">Vainqueur : <b>{label(m.winner)}</b></span>
-                                                : pendingWinner
-                                                    ? <span style={{ opacity: 0.9 }}>Sélectionné : {label(pendingWinner)}</span>
-                                                    : <span style={{ opacity: 0.6 }}>—</span>
-                                            }
-                                        </div>
-
-                                        <div className="stack">
-                                            <div className={`matchline ${m.status === 'done' && m.winner === m.player1 ? 'is-winner' : ''} ${isSelectedP1 ? 'is-pending' : ''}`}>
-                                                <span>{label(m.player1)}</span>
-                                                {canEdit && m.player1 && m.status !== 'done' && (
-                                                    <Button size="sm" variant="ghost" onClick={() => selectWinner(m, m.player1 as string)}>Gagnant</Button>
-                                                )}
-                                            </div>
-
-                                            <div className={`matchline ${m.status === 'done' && m.winner === m.player2 ? 'is-winner' : ''} ${isSelectedP2 ? 'is-pending' : ''}`}>
-                                                <span>{label(m.player2)}</span>
-                                                {canEdit && m.player2 && m.status !== 'done' && (
-                                                    <Button size="sm" variant="ghost" onClick={() => selectWinner(m, m.player2 as string)}>Gagnant</Button>
-                                                )}
-                                            </div>
-                                        </div>
-
-                                        {canEdit && (
-                                            <div className="hstack" style={{ marginTop: 8 }}>
-                                                <span className="spacer" />
-                                                <Button size="sm" variant="danger" onClick={() => resetMatch(m)}>Réinitialiser</Button>
-                                            </div>
-                                        )}
-                                    </div>
-                                </div>
-                            );
-                        })}
-                    </div>
-                ))}
-
                 {/* Rien à afficher */}
-                {roundsWB.length === 0 && !(uiMode === 'pool' && activePoolTab === 'Playoffs') && !isBuilding && (
+                {uiMode !== 'pool' && uiMode !== 'bracket' && !isBuilding && (
                     <div style={{ opacity: 0.7 }}>Aucun match à afficher.</div>
                 )}
             </div>
