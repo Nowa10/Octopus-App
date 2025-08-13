@@ -28,16 +28,15 @@ type M = {
 
 type TournamentMeta = {
     code: string;
-    format?: 'pool' | 'bracket' | null; // utilisé pour l’UI
+    format?: 'pool' | 'bracket' | null; // pour l’UI seulement
 };
 
 /* ============================
    Utils purs
    ============================ */
-function isPowerOfTwo(n: number) { return n > 0 && (n & (n - 1)) === 0; }
 function nextPowerOfTwo(n: number) { let p = 1; while (p < n) p <<= 1; return p; }
 
-// Round-robin canonique (méthode du cercle)
+// Round-robin (méthode du cercle)
 function rrPairsAllRounds(ids: (string | null)[]) {
     const n = ids.length;
     const total = n - 1;
@@ -49,7 +48,7 @@ function rrPairsAllRounds(ids: (string | null)[]) {
         rounds.push(pairs);
         const fixed = arr[0];
         const rest = arr.slice(1);
-        rest.unshift(rest.pop() as string | null); // dernier -> devant
+        rest.unshift(rest.pop() as string | null);
         arr = [fixed, ...rest];
     }
     return rounds;
@@ -67,14 +66,9 @@ function serpentineSplit(ids: string[], K: number) {
     return pools;
 }
 
-// Ta liste “autorisée” pour les brackets manuels
+/* Autoriser bracket pour 2..32 (BYE si besoin) */
 function bracketAllowed(n: number) {
-    if (n === 4) return true;
-    if (n >= 7 && n <= 8) return true;
-    if (n >= 11 && n <= 12) return true;
-    if (n >= 15 && n <= 16) return true;
-    if (n === 32) return true;
-    return false;
+    return n >= 2 && n <= 32;
 }
 
 /* ============================
@@ -91,13 +85,13 @@ export default function MatchList({
     const [people, setPeople] = useState<Record<string, P>>({});
     const [tournament, setTournament] = useState<TournamentMeta | null>(null);
 
-    // Mode d’affichage courant
+    // Mode UI courant
     const [uiMode, setUiMode] = useState<'none' | 'pool' | 'bracket'>('none');
 
-    // Bracket tabs
+    // Onglets Bracket
     const [activeBracket, setActiveBracket] = useState<'winner' | 'loser'>('winner');
 
-    // Pools tabs UI
+    // Onglets Pools
     const [poolTabs, setPoolTabs] = useState<{
         labels: string[];
         idsByPool: string[][];
@@ -105,12 +99,9 @@ export default function MatchList({
     }>({ labels: [], idsByPool: [], roundsByPool: [] });
     const [activePoolTab, setActivePoolTab] = useState<string | null>(null);
 
-    // sélection groupée des gagnants
+    // Sélection groupée des vainqueurs
     const [pending, setPending] = useState<Record<string, string>>({});
     const pendingCount = Object.keys(pending).length;
-
-    // mémorise K utilisé la dernière fois (utile après reload)
-    const [lastPoolsK, setLastPoolsK] = useState<number | null>(null);
 
     /* ============================
        I/O
@@ -120,24 +111,20 @@ export default function MatchList({
             .from('matches').select('*')
             .eq('tournament_id', tournamentId)
             .order('round').order('slot');
-        const ms = (m ?? []) as unknown as M[];
-        setMatches(ms);
+        setMatches((m ?? []) as M[]);
 
         const { data: ps } = await supabase
             .from('profiles').select('id,first_name,last_name,wins');
         const map: Record<string, P> = {};
-        (ps ?? []).forEach((p) => { const pp = p as unknown as P; map[pp.id] = pp; });
+        (ps ?? []).forEach((p) => { const pp = p as P; map[pp.id] = pp; });
         setPeople(map);
 
         const { data: t } = await supabase
             .from('tournaments').select('code,format').eq('id', tournamentId).single();
-        const val = t && typeof (t as { format?: string }).format === 'string'
-            ? (t as { format?: string }).format
-            : null;
+        const val = t && typeof (t as { format?: string }).format === 'string' ? (t as { format?: string }).format : null;
         const format: TournamentMeta['format'] = val === 'pool' || val === 'bracket' ? val : null;
         setTournament({ code: (t as { code?: string })?.code || '', format });
 
-        // déduit uiMode simple : si format est défini on s’y tient
         if (format === 'bracket') setUiMode('bracket');
         else if (format === 'pool') setUiMode('pool');
         else setUiMode('none');
@@ -145,9 +132,7 @@ export default function MatchList({
 
     useEffect(() => { void load(); }, [load]);
 
-    // Récupère le roster du tournoi
     async function getRoster(): Promise<string[]> {
-        // 1) table tournoi_participants si dispo
         const { data: r1 } = await supabase
             .from('tournament_participants')
             .select('profile_id')
@@ -155,13 +140,31 @@ export default function MatchList({
         const ids1 = (r1 ?? []).map((r) => (r as { profile_id: string }).profile_id);
         if (ids1.length > 0) return ids1;
 
-        // 2) fallback via matches existants
         const { data: r2 } = await supabase
             .from('matches').select('player1,player2').eq('tournament_id', tournamentId);
         type Row = { player1: string | null; player2: string | null };
         const set = new Set<string>();
         (r2 as Row[] | null)?.forEach((m) => { if (m.player1) set.add(m.player1); if (m.player2) set.add(m.player2); });
         return [...set];
+    }
+
+    async function fetchRound(bracket: 'winner' | 'loser', round: number): Promise<M[]> {
+        const { data } = await supabase
+            .from('matches').select('*')
+            .eq('tournament_id', tournamentId)
+            .eq('bracket_type', bracket)
+            .eq('round', round)
+            .order('slot', { ascending: true });
+        return (data ?? []) as M[];
+    }
+
+    async function getWBMaxRound(): Promise<number> {
+        const { data } = await supabase
+            .from('matches').select('round')
+            .eq('tournament_id', tournamentId)
+            .eq('bracket_type', 'winner');
+        const arr = (data ?? []).map((x) => (x as { round: number }).round);
+        return arr.length ? Math.max(...arr) : 0;
     }
 
     async function ensureMatch(round: number, slot: number, bracket: 'winner' | 'loser') {
@@ -172,7 +175,7 @@ export default function MatchList({
             .eq('round', round)
             .eq('slot', slot)
             .limit(1);
-        if (existing && existing[0]) return existing[0] as unknown as M;
+        if (existing && existing[0]) return existing[0] as M;
 
         const { data } = await supabase
             .from('matches')
@@ -182,7 +185,7 @@ export default function MatchList({
                 player1: null, player2: null, winner: null,
             })
             .select('*').single();
-        return data as unknown as M;
+        return data as M;
     }
 
     async function setPlayers(round: number, slot: number, p1: string | null, p2: string | null, bracket: 'winner' | 'loser' = 'winner') {
@@ -195,22 +198,17 @@ export default function MatchList({
     }
 
     /* ============================
-       Génération — POULLES (manuelle)
+       Génération — POOLS
        ============================ */
     async function generatePools(K: number) {
         setInfo(null);
         setIsBuilding(true);
         try {
             const roster = await getRoster();
-            if (roster.length < 3) {
-                setInfo('Pas assez de joueurs pour des poules (min 3).');
-                return;
-            }
+            if (roster.length < 3) { setInfo('Pas assez de joueurs pour des poules (min 3).'); return; }
 
-            // reset
             await clearAllMatches();
 
-            // serpentin + rounds
             const pools = serpentineSplit(roster, K);
             const roundsByPool: number[][] = pools.map(() => []);
             let nextRound = 1;
@@ -222,7 +220,7 @@ export default function MatchList({
                 for (let g = 0; g < roundsRR.length; g++) {
                     let slot = 1;
                     for (const [a, b] of roundsRR[g]) {
-                        if (!a || !b) continue; // on ne stocke pas les BYE
+                        if (!a || !b) continue; // pas de BYE en DB
                         await setPlayers(nextRound, slot++, a, b, 'winner');
                     }
                     roundsByPool[p].push(nextRound);
@@ -230,8 +228,6 @@ export default function MatchList({
                 }
             }
 
-            // Mémorise K pour l’onglet + persiste format
-            setLastPoolsK(K);
             setPoolTabs({
                 labels: pools.map((_, i) => `Pool ${i + 1}`).concat('Playoffs'),
                 idsByPool: pools,
@@ -243,13 +239,12 @@ export default function MatchList({
 
             await load();
             setInfo(`Poules générées (${K}).`);
-        } finally {
-            setIsBuilding(false);
-        }
+        } finally { setIsBuilding(false); }
     }
 
     /* ============================
-       Génération — BRACKET (manuelle)
+       Génération — BRACKET
+       (R1 SEULEMENT ; rounds suivants générés après “Confirmer”)
        ============================ */
     async function generateBracketFromRoster() {
         setInfo(null);
@@ -257,15 +252,10 @@ export default function MatchList({
         try {
             const roster = await getRoster();
             const n = roster.length;
-            if (!bracketAllowed(n)) {
-                setInfo(`Taille ${n} refusée pour un bracket manuel. Autorisé: 4, 7–8, 11–12, 15–16, 32.`);
-                return;
-            }
+            if (!bracketAllowed(n)) { setInfo(`Taille ${n} non supportée (attendu 2..32).`); return; }
 
-            // reset
             await clearAllMatches();
 
-            // Seeding canonique sur U = power of two >= n
             const size = nextPowerOfTwo(n);
             const pairs: Array<[string | null, string | null]> = [];
             for (let i = 0; i < size / 2; i++) {
@@ -275,11 +265,9 @@ export default function MatchList({
                 pairs.push([s1, s2]);
             }
 
-            // Round 1 exact
             let slot = 1;
             for (const [p1, p2] of pairs) {
                 await setPlayers(1, slot, p1, p2, 'winner');
-                // Auto-qualif si BYE
                 if (p1 && !p2) {
                     await supabase.from('matches').update({ winner: p1, status: 'done' })
                         .eq('tournament_id', tournamentId).eq('bracket_type', 'winner').eq('round', 1).eq('slot', slot);
@@ -290,45 +278,25 @@ export default function MatchList({
                 slot++;
             }
 
-            // Structure des tours suivants (juste ce qu’il faut)
-            let rSize = size / 2;
-            let r = 2;
-            while (rSize >= 1) {
-                for (let s = 1; s <= rSize; s++) {
-                    await ensureMatch(r, s, 'winner');
-                }
-                r++;
-                rSize = rSize / 2;
-            }
-
-            // Bracket mode + persiste format
+            // NE PAS créer les rounds suivants ici
             setUiMode('bracket');
             await supabase.from('tournaments').update({ format: 'bracket' }).eq('id', tournamentId);
 
             await load();
-            setInfo('Bracket générée.');
+            setInfo('Bracket (Round 1) générée. Valide les gagnants pour créer le round suivant.');
         } finally { setIsBuilding(false); }
     }
 
     /* ============================
-       Loser Bracket simple par “vague”
+       Loser Bracket simple (vague du round WB terminé)
        ============================ */
     async function ensureConsolationForRound(wbRound: number) {
-        // vérifie si le round WB est entièrement terminé
-        const { data: wbs } = await supabase
-            .from('matches').select('*')
-            .eq('tournament_id', tournamentId)
-            .eq('bracket_type', 'winner')
-            .eq('round', wbRound)
-            .order('slot', { ascending: true });
+        const wbs = await fetchRound('winner', wbRound);
+        if (wbs.length === 0) return;
+        if (wbs.some((m) => m.status !== 'done')) return;
 
-        const wbMatches = (wbs ?? []) as unknown as M[];
-        if (wbMatches.length === 0) return;
-        if (wbMatches.some((m) => m.status !== 'done')) return;
-
-        // collecte des perdants (dans l’ordre des slots) et appairements
         const losers: string[] = [];
-        wbMatches.forEach((m) => {
+        wbs.forEach((m) => {
             const l = m.winner === m.player1 ? m.player2 : m.player1;
             if (l) losers.push(l);
         });
@@ -341,40 +309,39 @@ export default function MatchList({
     }
 
     /* ============================
-       Propagation KO direct (WB)
+       Avancement du BRACKET (crée le prochain round si le courant est terminé)
        ============================ */
-    async function setPlayerOnMatch(round: number, slot: number, playerId: string, prefer: 'player1' | 'player2') {
-        const m = await ensureMatch(round, slot, 'winner');
-        const patch: Partial<M> = {};
-        if (prefer === 'player1' && !m.player1) patch.player1 = playerId;
-        if (prefer === 'player2' && !m.player2) patch.player2 = playerId;
-        if (Object.keys(patch).length) await supabase.from('matches').update(patch).eq('id', m.id);
-    }
+    async function advanceWBIfReady() {
+        const max = await getWBMaxRound();
+        if (max === 0) return;
 
-    async function applyWinner(m: M, winnerId: string) {
-        await supabase.from('matches').update({ winner: winnerId, status: 'done' }).eq('id', m.id);
+        const current = await fetchRound('winner', max);
+        if (current.length === 1 && current[0].status === 'done') return; // finale déjà finie
 
-        if (uiMode !== 'bracket') return; // pas de propagation spéciale en pools
+        // round pas encore fini → stop
+        if (current.some((m) => m.status !== 'done')) return;
 
-        if (m.bracket_type === 'winner') {
-            // Propagation vers le prochain tour WB
-            const nextRound = m.round + 1;
-            const nextSlot = Math.ceil(m.slot / 2);
-            const prefer: 'player1' | 'player2' = m.slot % 2 === 1 ? 'player1' : 'player2';
-            await setPlayerOnMatch(nextRound, nextSlot, winnerId, prefer);
+        // si le prochain round existe déjà → stop
+        const next = await fetchRound('winner', max + 1);
+        if (next.length > 0) return;
 
-            // Crée la “vague” de loser une fois tout le round WB terminé
-            await ensureConsolationForRound(m.round);
+        // crée les matchs du round suivant avec l’ordre des slots
+        let slot = 1;
+        for (let i = 0; i + 1 < current.length; i += 2) {
+            const a = current[i], b = current[i + 1];
+            const w1 = a.winner ?? null, w2 = b.winner ?? null;
+            await setPlayers(max + 1, slot++, w1, w2, 'winner');
         }
     }
 
     /* ============================
-       Validation groupée / reset
+       Propagation vainqueur (WB seulement)
        ============================ */
     function selectWinner(m: M, winnerId: string) {
         if (m.status === 'done') return;
         setPending((prev) => ({ ...prev, [m.id]: winnerId }));
     }
+
     function clearPending() { setPending({}); }
 
     async function confirmPending() {
@@ -386,13 +353,25 @@ export default function MatchList({
                 const m = matches.find((x) => x.id === id);
                 if (m && w) items.push({ m, winnerId: w });
             }
-            // ordre cohérent (WB avant LB, petit round -> grand)
+            // ordre stable : winner avant loser, par round croissant
             items.sort((a, b) => {
                 if (a.m.bracket_type !== b.m.bracket_type) return a.m.bracket_type === 'winner' ? -1 : 1;
                 if (a.m.round !== b.m.round) return a.m.round - b.m.round;
                 return a.m.slot - b.m.slot;
             });
-            for (const it of items) await applyWinner(it.m, it.winnerId);
+
+            // Applique les vainqueurs
+            for (const it of items) {
+                await supabase.from('matches').update({ winner: it.winnerId, status: 'done' }).eq('id', it.m.id);
+            }
+
+            // Si BRACKET : 1) LB pour le round WB, 2) Next round si tout WB courant est fait
+            if (uiMode === 'bracket') {
+                const touchedWB = new Set(items.filter(i => i.m.bracket_type === 'winner').map(i => i.m.round));
+                for (const r of touchedWB) await ensureConsolationForRound(r);
+                await advanceWBIfReady();
+            }
+
             setPending({});
             await load();
         } finally { setIsBuilding(false); }
@@ -407,24 +386,25 @@ export default function MatchList({
     }
 
     /* ============================
-       Labels & vues
+       Vues & regroupements
        ============================ */
     const label = (id: string | null) =>
         id ? `${people[id]?.first_name || '?'} ${people[id]?.last_name || ''}` : 'BYE';
 
-    // Filtres d’affichage
-    const filteredWinnerMatches = useMemo(() => matches.filter((m) => m.bracket_type === 'winner'), [matches]);
-    const filteredLoserMatches = useMemo(() => matches.filter((m) => m.bracket_type === 'loser'), [matches]);
+    const filteredWinnerMatches = useMemo(
+        () => matches.filter((m) => m.bracket_type === 'winner'),
+        [matches]
+    );
+    const filteredLoserMatches = useMemo(
+        () => matches.filter((m) => m.bracket_type === 'loser'),
+        [matches]
+    );
 
-    // En mode POOL, on filtre par onglet
+    // En mode POOL, on montre la poule sélectionnée
     const poolMatchesForUI = useMemo(() => {
         if (uiMode !== 'pool') return filteredWinnerMatches;
         if (!activePoolTab || poolTabs.labels.length === 0) return filteredWinnerMatches;
-
-        if (activePoolTab === 'Playoffs') {
-            // Placeholder : pas de génération pour l’instant
-            return [] as M[];
-        }
+        if (activePoolTab === 'Playoffs') return [] as M[];
 
         const idx = poolTabs.labels.indexOf(activePoolTab);
         if (idx === -1) return filteredWinnerMatches;
@@ -432,14 +412,11 @@ export default function MatchList({
         const idsSet = new Set(poolTabs.idsByPool[idx] || []);
         const roundsSet = new Set(poolTabs.roundsByPool[idx] || []);
         return filteredWinnerMatches.filter(
-            (m) =>
-                m.player1 && m.player2 &&
-                idsSet.has(m.player1) && idsSet.has(m.player2) &&
-                roundsSet.has(m.round)
+            (m) => m.player1 && m.player2 && idsSet.has(m.player1) && idsSet.has(m.player2) && roundsSet.has(m.round)
         );
     }, [uiMode, filteredWinnerMatches, activePoolTab, poolTabs]);
 
-    // Rounds
+    // Regroupement par rounds (WB)
     const roundsWB = useMemo(() => {
         const src = uiMode === 'pool' ? poolMatchesForUI : filteredWinnerMatches;
         const byRound = new Map<number, M[]>();
@@ -451,6 +428,7 @@ export default function MatchList({
         return [...byRound.entries()].sort((a, b) => a[0] - b[0]);
     }, [uiMode, poolMatchesForUI, filteredWinnerMatches]);
 
+    // Regroupement par rounds (LB)
     const roundsLB = useMemo(() => {
         const byRound = new Map<number, M[]>();
         for (const m of filteredLoserMatches) {
@@ -468,7 +446,7 @@ export default function MatchList({
 
     return (
         <div className="container stack">
-            {/* Barre d’actions MANUELLES */}
+            {/* Actions MANUELLES */}
             <div className="card">
                 <div className="card__content hstack" style={{ gap: 8, flexWrap: 'wrap' }}>
                     {tournamentCode && <span>Code: <b>{tournamentCode}</b></span>}
@@ -479,11 +457,15 @@ export default function MatchList({
                                 variant="ghost"
                                 onClick={() => {
                                     setIsBuilding(true);
-                                    clearAllMatches().then(() => {
-                                        setUiMode('none');
-                                        setPoolTabs({ labels: [], idsByPool: [], roundsByPool: [] });
-                                        setActivePoolTab(null);
-                                    }).then(load).finally(() => setIsBuilding(false));
+                                    clearAllMatches()
+                                        .then(() => {
+                                            setUiMode('none');
+                                            setPoolTabs({ labels: [], idsByPool: [], roundsByPool: [] });
+                                            setActivePoolTab(null);
+                                            setInfo(null);
+                                        })
+                                        .then(load)
+                                        .finally(() => setIsBuilding(false));
                                 }}
                             >
                                 Vider les matchs
@@ -525,7 +507,7 @@ export default function MatchList({
                 </div>
             )}
 
-            {/* Onglets haut : Pools OU Brackets */}
+            {/* Onglets : Bracket OU Pools */}
             {uiMode === 'bracket' && (
                 <Segment
                     value={activeBracket}
@@ -602,16 +584,16 @@ export default function MatchList({
                     </div>
                 ))}
 
-                {/* Placeholder Playoffs en mode POOL */}
+                {/* Placeholder Playoffs pour Pools */}
                 {uiMode === 'pool' && (activePoolTab === 'Playoffs') && (
                     <div className="card">
                         <div className="card__content">
-                            <b>Playoffs</b> — (désactivé pour l’instant). Tu pourras plus tard générer un bracket Top-2/Top-X ici.
+                            <b>Playoffs</b> — (désactivé pour l’instant).
                         </div>
                     </div>
                 )}
 
-                {/* Loser side (seulement en mode bracket) */}
+                {/* Loser side (bracket uniquement) */}
                 {uiMode === 'bracket' && activeBracket === 'loser' && roundsLB.map(([roundIdx, items]) => (
                     <div key={`lb-${roundIdx}`} className="stack">
                         <div className="round-title">Loser Round {roundIdx}</div>
