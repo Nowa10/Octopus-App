@@ -339,33 +339,46 @@ export default function MatchList({
 
     async function ensureLoserRound(r: number) {
         const wbMax = await getMaxRound('winner');
-        if (wbMax === 0 || r >= wbMax) return;
+        if (wbMax === 0) return;
 
-        const feed = await getLosersOfWBRound(r);
+        // ✅ Si on est au même index que la finale WB,
+        //    on crée la "finale LB" = entre winners(LB r-1) uniquement.
+        if (r === wbMax) {
+            const carry = await getWinnersOfLBRound(r - 1);
+            if (!carry || carry.length < 2) return;
+
+            const existing = await fetchRound('loser', r);
+            if (existing.length > 0) return;
+
+            let slot = 1;
+            for (let i = 0; i + 1 < carry.length; i += 2) {
+                await setPlayersIfBoth(r, slot++, carry[i]!, carry[i + 1]!, 'loser');
+            }
+            return;
+        }
+
+        // 🔽 Rounds standards (r < wbMax) :
+        const feed = await getLosersOfWBRound(r); // perdants du WB r
         if (!feed || feed.length === 0) return;
 
         const existing = await fetchRound('loser', r);
         if (existing.length > 0) return;
 
-        // ✅ const (au lieu de let) car on ne réassigne pas la variable
         const pairs: Array<[string, string]> = [];
 
         if (r === 1) {
+            // Croisement R1 : [0,2,1,3] -> (0vs2) (1vs3)
             const evenIdx = feed.filter((_, i) => i % 2 === 0);
             const oddIdx = feed.filter((_, i) => i % 2 === 1);
             const reordered = [...evenIdx, ...oddIdx];
             for (let i = 0; i + 1 < reordered.length; i += 2) {
-                const a = reordered[i]!;
-                const b = reordered[i + 1]!;
-                pairs.push([a, b]);
+                pairs.push([reordered[i]!, reordered[i + 1]!]);
             }
         } else {
             const carry = await getWinnersOfLBRound(r - 1);
             if (!carry || carry.length === 0) return;
             const k = Math.min(carry.length, feed.length);
-            for (let i = 0; i < k; i++) {
-                pairs.push([carry[i]!, feed[i]!]);
-            }
+            for (let i = 0; i < k; i++) pairs.push([carry[i]!, feed[i]!]);
         }
 
         if (pairs.length === 0) return;
@@ -377,18 +390,17 @@ export default function MatchList({
     }
 
 
-
-
     // ➜ remplace ta version
     async function rebuildLoserProgression() {
         const wbMax = await getMaxRound('winner');
         if (wbMax === 0) return;
 
-        // on nourrit jusqu’à WB (wbMax - 1) uniquement (la finale WB ne descend pas)
-        for (let r = 1; r <= wbMax - 1; r++) {
+        // ⚠️ on va jusqu’à wbMax (et plus seulement wbMax - 1)
+        for (let r = 1; r <= wbMax; r++) {
             await ensureLoserRound(r);
         }
     }
+
 
     /* ============================
        Avancement Winner: crée le prochain round uniquement si l’actuel est fini
