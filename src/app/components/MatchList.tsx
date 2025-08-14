@@ -298,6 +298,18 @@ export default function MatchList({
         } finally { setIsBuilding(false); }
     }
 
+    // ➜ ajoute cette variante, sans toucher à ton setPlayers existant
+    async function setPlayersIfBoth(
+        round: number, slot: number,
+        p1: string | null, p2: string | null,
+        bracket: 'winner' | 'loser' = 'loser'
+    ) {
+        if (!p1 || !p2) return;                // ⛔ jamais de BYE
+        const m = await ensureMatch(round, slot, bracket);
+        await supabase.from('matches').update({ player1: p1, player2: p2 }).eq('id', m.id);
+    }
+
+
     /* ============================
        Loser Bracket — Progressif (capable de remonter jusqu’à la 3e place)
        Règle : LB Round r = Winners(LB r-1) + Losers(WB r). On ne crée LB r que si:
@@ -326,73 +338,64 @@ export default function MatchList({
     }
 
     // ➜ remplace ta version existante
+    // ➜ remplace entièrement ta fonction
     async function ensureLoserRound(r: number) {
-        // On ne nourrit **pas** le LB avec les perdants de la finale WB.
+        // on ne nourrit pas avec la finale WB
         const wbMax = await getMaxRound('winner');
-        if (wbMax === 0) return;
-        if (r >= wbMax) return; // ⛔ rien après le round (wbMax - 1)
+        if (wbMax === 0 || r >= wbMax) return;
 
-        // prérequis: WB r fini
-        const feed = await getLosersOfWBRound(r);
-        if (!feed) return;
+        const feed = await getLosersOfWBRound(r);       // perdants du WB r (dans l’ordre des slots)
+        if (!feed || feed.length === 0) return;
 
-        // prérequis: LB r-1 fini (sauf r=1)
-        let carry: string[] = [];
-        if (r > 1) {
-            const wPrev = await getWinnersOfLBRound(r - 1);
-            if (!wPrev) return; // on attend que le LB précédent soit terminé
-            carry = wPrev;
-        }
-
-        const entrants = [...carry, ...feed];
-        if (entrants.length < 2) return;
-
-        // si LB r existe déjà, on ne refabrique pas
+        // si LB r existe déjà, on ne recrée pas
         const existing = await fetchRound('loser', r);
         if (existing.length > 0) return;
 
-        // --- Pairing "alterné" pour éviter les re-matchs immédiats ---
-        // On forme d'abord des paires (carry[i] vs feed[i]).
-        const pairs: Array<[string | null, string | null]> = [];
-        const L = Math.max(carry.length, feed.length);
-        for (let i = 0; i < L; i++) {
-            const a = carry[i] ?? null;
-            const b = feed[i] ?? null;
-            if (a || b) pairs.push([a, b]);
-        }
-        // S'il reste des joueurs "orphelins" (longueurs inégales), on complète proprement :
-        // - on concatène le "surplus" restant (qui seront entre eux en dernier recours).
-        const rest: string[] = [];
-        if (carry.length > feed.length) rest.push(...carry.slice(feed.length));
-        if (feed.length > carry.length) rest.push(...feed.slice(carry.length));
-        for (let i = 0; i < rest.length; i += 2) {
-            pairs.push([rest[i] ?? null, rest[i + 1] ?? null]);
+        let pairs: Array<[string, string]> = [];
+
+        if (r === 1) {
+            // --- LB R1 = croisement des perdants du WB R1 ---
+            // réordonne: even indices d’abord, puis odd -> ex: [0,2,1,3]
+            const evenIdx = feed.filter((_, i) => i % 2 === 0);
+            const oddIdx = feed.filter((_, i) => i % 2 === 1);
+            const reordered = [...evenIdx, ...oddIdx];
+
+            for (let i = 0; i + 1 < reordered.length; i += 2) {
+                const a = reordered[i]!;
+                const b = reordered[i + 1]!;
+                pairs.push([a, b]);
+            }
+        } else {
+            // --- R>1 : winners(LB r-1) vs losers(WB r) ---
+            const carry = await getWinnersOfLBRound(r - 1);
+            if (!carry || carry.length === 0) return;
+
+            const k = Math.min(carry.length, feed.length);   // pas de surplus -> pas de BYE
+            for (let i = 0; i < k; i++) {
+                pairs.push([carry[i]!, feed[i]!]);
+            }
         }
 
-        // Création des matchs LB r (KO direct), BYE auto si besoin
+        if (pairs.length === 0) return;
+
+        // crée les matchs sans BYE
         let slot = 1;
         for (const [a, b] of pairs) {
-            await setPlayers(r, slot, a ?? null, b ?? null, 'loser');
-            if (a && !b) {
-                await supabase.from('matches').update({ winner: a, status: 'done' })
-                    .eq('tournament_id', tournamentId).eq('bracket_type', 'loser').eq('round', r).eq('slot', slot);
-            } else if (!a && b) {
-                await supabase.from('matches').update({ winner: b, status: 'done' })
-                    .eq('tournament_id', tournamentId).eq('bracket_type', 'loser').eq('round', r).eq('slot', slot);
-            }
-            slot++;
+            await setPlayersIfBoth(r, slot++, a, b, 'loser');
         }
     }
 
 
+
+    // ➜ remplace ta version
     async function rebuildLoserProgression() {
         const wbMax = await getMaxRound('winner');
         if (wbMax === 0) return;
-        for (let r = 1; r <= wbMax; r++) {
+
+        // on nourrit jusqu’à WB (wbMax - 1) uniquement (la finale WB ne descend pas)
+        for (let r = 1; r <= wbMax - 1; r++) {
             await ensureLoserRound(r);
         }
-        // Optionnel : si WB final terminé et LB dernier round terminé, tu peux considérer
-        // le vainqueur LB = 3e place (petite finale).
     }
 
     /* ============================
