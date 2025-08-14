@@ -337,40 +337,32 @@ export default function MatchList({
         return winners;
     }
 
-    // ➜ remplace ta version existante
-    // ➜ remplace entièrement ta fonction
     async function ensureLoserRound(r: number) {
-        // on ne nourrit pas avec la finale WB
         const wbMax = await getMaxRound('winner');
         if (wbMax === 0 || r >= wbMax) return;
 
-        const feed = await getLosersOfWBRound(r);       // perdants du WB r (dans l’ordre des slots)
+        const feed = await getLosersOfWBRound(r);
         if (!feed || feed.length === 0) return;
 
-        // si LB r existe déjà, on ne recrée pas
         const existing = await fetchRound('loser', r);
         if (existing.length > 0) return;
 
-        let pairs: Array<[string, string]> = [];
+        // ✅ const (au lieu de let) car on ne réassigne pas la variable
+        const pairs: Array<[string, string]> = [];
 
         if (r === 1) {
-            // --- LB R1 = croisement des perdants du WB R1 ---
-            // réordonne: even indices d’abord, puis odd -> ex: [0,2,1,3]
             const evenIdx = feed.filter((_, i) => i % 2 === 0);
             const oddIdx = feed.filter((_, i) => i % 2 === 1);
             const reordered = [...evenIdx, ...oddIdx];
-
             for (let i = 0; i + 1 < reordered.length; i += 2) {
                 const a = reordered[i]!;
                 const b = reordered[i + 1]!;
                 pairs.push([a, b]);
             }
         } else {
-            // --- R>1 : winners(LB r-1) vs losers(WB r) ---
             const carry = await getWinnersOfLBRound(r - 1);
             if (!carry || carry.length === 0) return;
-
-            const k = Math.min(carry.length, feed.length);   // pas de surplus -> pas de BYE
+            const k = Math.min(carry.length, feed.length);
             for (let i = 0; i < k; i++) {
                 pairs.push([carry[i]!, feed[i]!]);
             }
@@ -378,12 +370,12 @@ export default function MatchList({
 
         if (pairs.length === 0) return;
 
-        // crée les matchs sans BYE
         let slot = 1;
         for (const [a, b] of pairs) {
             await setPlayersIfBoth(r, slot++, a, b, 'loser');
         }
     }
+
 
 
 
